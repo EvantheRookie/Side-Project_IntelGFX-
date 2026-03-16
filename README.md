@@ -1,6 +1,8 @@
 # BMG vLLM Ultimate Control Center (Intel Arc Battlemage)
 
-All-in-one toolkit for running LLM inference and benchmarks on Intel Arc discrete GPUs (Battlemage B580/B770 series) using the official [Intel llm-scaler-vllm](https://github.com/intel/llm-scaler) Docker image.
+A side project for Intel Arc Battlemage (BMG) GPU owners who want to run large language models locally. This all-in-one bash toolkit handles everything from Docker setup and model downloading to serving, benchmarking, and real-time GPU monitoring -- all aligned with the official [Intel llm-scaler-vllm](https://github.com/intel/llm-scaler) specification.
+
+No deep knowledge of vLLM or Docker required -- the script walks you through each step interactively.
 
 ## Features
 
@@ -19,6 +21,19 @@ All-in-one toolkit for running LLM inference and benchmarks on Intel Arc discret
 | **Git + git-lfs** | Required for downloading models from HuggingFace (`sudo apt install git-lfs && git lfs install`) |
 | **GCC** | Required only for the C GPU monitor (optional) |
 | **Python 3** | Required only for Mode 1 (Gradio Web GUI) |
+
+## Tested Hardware & Models
+
+**GPU:** Intel Battlemage (BMG) series
+
+**Models successfully tested:**
+
+| Model | Size | Status |
+|---|---|---|
+| DeepSeek-R1-Distill-Qwen-7B | 7B | Working |
+| Qwen2.5-14B-Instruct | 14B | Working |
+
+> Other HuggingFace models should work as long as they fit in VRAM. The smart profiler will calculate whether a model fits before launching.
 
 ### Driver Installation
 
@@ -257,6 +272,16 @@ The script is fully self-contained. It embeds the C GPU monitor source code and 
 ### Docker image version
 - The Intel README recommends pinning to a specific release version
 - Check releases at: https://github.com/intel/llm-scaler/releases
+
+## Known Issues & Limitations
+
+- **Multi-GPU tensor parallelism not fully tested** -- the script auto-detects multiple GPUs and sets `-tp`, but edge cases may exist. Single-GPU setups are the primary tested configuration.
+- **First server start is slow** -- vLLM needs to load the full model into VRAM on cold start. This is normal and can take several minutes for larger models.
+- **VRAM is the bottleneck** -- models that exceed available VRAM will fail to load. Use the smart profiler recommendation or reduce `max-model-len` manually.
+
+## Author
+
+**EvantheRookie** -- [GitHub](https://github.com/EvantheRookie)
 
 ## References
 
