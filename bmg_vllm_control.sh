@@ -452,18 +452,60 @@ fi
 # STEP 3: Model Selection
 # ------------------------------------------------------------------------------
 echo -e "\n${CYAN}--- Model Selection ---${NC}"
-echo "Models in /home/intel/LLM/:"
+echo "Models already in /home/intel/LLM/:"
 ls -1 /home/intel/LLM/ | grep -v '^\.' || echo "(none)"
 echo "----------------------------------------------"
-read -p "Model folder name (or HF Repo ID to download): " USER_INPUT
-if [[ "$USER_INPUT" == *"/"* ]]; then
+echo -e "Enter one of:"
+echo -e "  ${GREEN}1)${NC} A HuggingFace URL   (e.g. https://huggingface.co/Qwen/Qwen3.5-9B)"
+echo -e "  ${GREEN}2)${NC} owner/model format   (e.g. Qwen/Qwen3.5-9B)"
+echo -e "  ${GREEN}3)${NC} Local folder name    (e.g. Qwen3.5-9B) if already downloaded"
+read -p "Model: " USER_INPUT
+
+# Strip trailing slashes
+USER_INPUT="${USER_INPUT%/}"
+
+# Parse input: extract model name and build clone URL
+if [[ "$USER_INPUT" == https://huggingface.co/* ]]; then
+    # Full URL provided -- extract model name from URL
+    REPO_PATH="${USER_INPUT#https://huggingface.co/}"
+    MODEL_NAME=$(basename "$REPO_PATH")
+    CLONE_URL="$USER_INPUT"
+elif [[ "$USER_INPUT" == *"/"* ]]; then
+    # owner/model format (e.g. Qwen/Qwen3.5-9B)
     MODEL_NAME=$(basename "$USER_INPUT")
-    echo -e "\nDownloading ${YELLOW}${USER_INPUT}${NC}..."
-    sudo docker exec -it lsv-container bash -c \
-        "export HF_ENDPOINT='https://hf-mirror.com' && \
-         huggingface-cli download ${USER_INPUT} --local-dir /llm/models/${MODEL_NAME}"
+    CLONE_URL="https://huggingface.co/${USER_INPUT}"
 else
-    MODEL_NAME=$USER_INPUT
+    # Local folder name -- no download needed
+    MODEL_NAME="$USER_INPUT"
+    CLONE_URL=""
+fi
+
+# Download via git clone if needed
+if [ -n "$CLONE_URL" ]; then
+    if [ -d "/home/intel/LLM/${MODEL_NAME}" ]; then
+        echo -e "${GREEN}[OK] /home/intel/LLM/${MODEL_NAME} already exists, skipping download.${NC}"
+    else
+        # Check git-lfs is installed (required for HF model weights)
+        if ! command -v git-lfs &>/dev/null; then
+            echo -e "${RED}[!] git-lfs is not installed. HuggingFace models require it.${NC}"
+            echo -e "${YELLOW}    Install with: sudo apt install git-lfs && git lfs install${NC}"
+            exit 1
+        fi
+        echo -e "\n${YELLOW}Cloning ${CLONE_URL} into /home/intel/LLM/${MODEL_NAME} ...${NC}"
+        echo -e "${YELLOW}(This may take a while for large models)${NC}"
+        git clone "$CLONE_URL" "/home/intel/LLM/${MODEL_NAME}"
+        if [ $? -ne 0 ]; then
+            echo -e "${RED}[FAIL] git clone failed. Check the URL and your network connection.${NC}"
+            exit 1
+        fi
+        echo -e "${GREEN}[OK] Model downloaded to /home/intel/LLM/${MODEL_NAME}${NC}"
+    fi
+fi
+
+# Verify model folder exists
+if [ ! -d "/home/intel/LLM/${MODEL_NAME}" ]; then
+    echo -e "${RED}[!] /home/intel/LLM/${MODEL_NAME} does not exist.${NC}"
+    exit 1
 fi
 # ------------------------------------------------------------------------------
 # STEP 4: Hardware Profiling + Smart Model Len

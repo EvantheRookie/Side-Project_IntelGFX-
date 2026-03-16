@@ -16,6 +16,7 @@ All-in-one toolkit for running LLM inference and benchmarks on Intel Arc discret
 | **Hardware** | Intel Arc discrete GPU (Battlemage B580, B770, or compatible) |
 | **OS** | Linux with Intel GPU drivers installed (`xpu-smi` must be available) |
 | **Docker** | Docker Engine with GPU passthrough support |
+| **Git + git-lfs** | Required for downloading models from HuggingFace (`sudo apt install git-lfs && git lfs install`) |
 | **GCC** | Required only for the C GPU monitor (optional) |
 | **Python 3** | Required only for Mode 1 (Gradio Web GUI) |
 
@@ -61,9 +62,21 @@ Container config:
 
 ### Step 3: Model Selection
 
-Lists models already in `/home/intel/LLM/`. You can either:
-- Enter a **folder name** for a model already downloaded
-- Enter a **HuggingFace Repo ID** (e.g. `deepseek-ai/DeepSeek-R1-Distill-Qwen-7B`) to download it inside the container
+Lists models already in `/home/intel/LLM/`. You can enter any of these formats:
+
+| Format | Example | What happens |
+|---|---|---|
+| HuggingFace URL | `https://huggingface.co/Qwen/Qwen3.5-9B` | Clones the repo via `git clone` |
+| owner/model | `Qwen/Qwen3.5-9B` | Builds the URL and clones automatically |
+| Local folder name | `Qwen3.5-9B` | Uses existing folder (no download) |
+
+Models are cloned to `/home/intel/LLM/<model_name>` on the host, which is already mounted into the container.
+
+> **Requires `git-lfs`:** HuggingFace models use Git LFS for large weight files. Install it first:
+> ```bash
+> sudo apt install git-lfs && git lfs install
+> ```
+> If the model folder already exists, the download is skipped automatically.
 
 ### Step 4: Hardware Profiling
 
