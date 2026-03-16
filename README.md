@@ -55,19 +55,24 @@ Example output:
 
 ### Step 3: Docker Setup (Version Selection)
 
-Shows all locally available `intel/llm-scaler-vllm` image versions and the current container's version (if any). You choose which version to use:
+Queries Docker Hub for all available `intel/llm-scaler-vllm` tags and shows which ones are already downloaded locally. The current container's version is marked with `*`.
 
-- **Press Enter** to keep the current container (no download needed)
+- **Press Enter** to keep the current container (no download, no rebuild)
 - **Type a version tag** (e.g. `1.3`, `0.14.0-b8.1`) to switch
 
-The script only pulls from Docker Hub if the chosen version isn't already downloaded locally. If switching versions, the old container is automatically replaced.
+Only pulls from Docker Hub if the chosen version isn't already downloaded. Falls back to showing local-only images if Docker Hub is unreachable.
 
 ```
-Locally available versions:
-  * 0.14.0-b8.1  (current container)
-  - 1.3
-Default: 0.14.0-b8.1
-Releases: https://github.com/intel/llm-scaler/blob/main/Releases.md
+============== Docker Image Selection ==============
+  Available on Docker Hub:
+    * 0.14.0-b8.1  [downloaded] [current container]
+      0.14.0-b8
+      1.3  [downloaded]
+      0.11.2
+      ...
+====================================================
+  Default: 0.14.0-b8.1
+  Releases: https://github.com/intel/llm-scaler/blob/main/Releases.md
 
 Press Enter to keep current (0.14.0-b8.1), or type a version tag:
 Version:

@@ -249,32 +249,75 @@ echo -e "  ${CYAN}Total VRAM per GPU: ${VRAM_MIB} MiB (${VRAM_GIB} GiB)${NC}"
 echo -e "\n${CYAN}--- Docker Setup ---${NC}"
 mkdir -p "$MODEL_DIR"
 
-# Show locally available intel/llm-scaler-vllm images
-LOCAL_TAGS=$(sudo docker images "intel/llm-scaler-vllm" --format '{{.Tag}}' 2>/dev/null | sort -V)
+# Detect current container image (if any)
 CURRENT_CONTAINER_IMAGE=""
-if sudo docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-    CURRENT_CONTAINER_IMAGE=$(sudo docker inspect --format='{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null || echo "")
+if sudo docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$" 2>/dev/null; then
+    CURRENT_CONTAINER_IMAGE=$(sudo docker inspect --format='{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null || true)
 fi
 
-echo "----------------------------------------------"
-if [ -n "$LOCAL_TAGS" ]; then
-    echo -e "  ${GREEN}Locally available versions:${NC}"
+# List all locally downloaded intel/llm-scaler-vllm tags
+# Use --filter to handle docker.io prefix variations
+LOCAL_TAGS=$(sudo docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
+    | grep 'intel/llm-scaler-vllm:' \
+    | sed 's|.*intel/llm-scaler-vllm:||' \
+    | sort -V || true)
+
+# Fetch available tags from Docker Hub (best-effort, skip on network failure)
+echo -e "${CYAN}Checking Docker Hub for available versions...${NC}"
+REMOTE_TAGS=$(curl -sf --max-time 10 \
+    "https://hub.docker.com/v2/repositories/intel/llm-scaler-vllm/tags/?page_size=50&ordering=-name" 2>/dev/null \
+    | grep -oP '"name"\s*:\s*"\K[^"]+' \
+    | sort -V || true)
+
+echo ""
+echo -e "${CYAN}============== Docker Image Selection ==============${NC}"
+
+# Show remote tags (available to download)
+if [ -n "$REMOTE_TAGS" ]; then
+    echo -e "  ${CYAN}Available on Docker Hub:${NC}"
     while IFS= read -r tag; do
-        if [ "intel/llm-scaler-vllm:${tag}" = "$CURRENT_CONTAINER_IMAGE" ]; then
-            echo -e "    ${GREEN}* ${tag}  (current container)${NC}"
-        else
-            echo -e "    - ${tag}"
+        # Check if this tag is already downloaded locally
+        IS_LOCAL=""
+        if [ -n "$LOCAL_TAGS" ]; then
+            echo "$LOCAL_TAGS" | grep -qx "$tag" 2>/dev/null && IS_LOCAL="yes" || true
         fi
-    done <<< "$LOCAL_TAGS"
+        IS_CURRENT=""
+        if [ "$CURRENT_CONTAINER_IMAGE" = "intel/llm-scaler-vllm:${tag}" ]; then
+            IS_CURRENT="yes"
+        fi
+
+        if [ -n "$IS_CURRENT" ]; then
+            echo -e "    ${GREEN}* ${tag}  [downloaded] [current container]${NC}"
+        elif [ -n "$IS_LOCAL" ]; then
+            echo -e "    ${GREEN}  ${tag}  [downloaded]${NC}"
+        else
+            echo -e "      ${tag}"
+        fi
+    done <<< "$REMOTE_TAGS"
 else
-    echo -e "  ${YELLOW}No local images found.${NC}"
+    # Fallback: show local tags only (no network)
+    echo -e "  ${YELLOW}Could not reach Docker Hub. Showing local images only.${NC}"
+    if [ -n "$LOCAL_TAGS" ]; then
+        echo -e "  ${GREEN}Locally available:${NC}"
+        while IFS= read -r tag; do
+            if [ "$CURRENT_CONTAINER_IMAGE" = "intel/llm-scaler-vllm:${tag}" ]; then
+                echo -e "    ${GREEN}* ${tag}  [current container]${NC}"
+            else
+                echo -e "    - ${tag}"
+            fi
+        done <<< "$LOCAL_TAGS"
+    else
+        echo -e "  ${YELLOW}No local images found.${NC}"
+    fi
 fi
-echo "----------------------------------------------"
+
+echo -e "${CYAN}====================================================${NC}"
 echo -e "  Default: ${CYAN}${DEFAULT_IMAGE_TAG}${NC}"
 echo -e "  Releases: https://github.com/intel/llm-scaler/blob/main/Releases.md"
 echo ""
 if [ -n "$CURRENT_CONTAINER_IMAGE" ]; then
-    echo -e "Press ${GREEN}Enter${NC} to keep current (${CURRENT_CONTAINER_IMAGE##*:}), or type a version tag:"
+    CURRENT_TAG="${CURRENT_CONTAINER_IMAGE##*:}"
+    echo -e "Press ${GREEN}Enter${NC} to keep current (${CURRENT_TAG}), or type a version tag:"
 else
     echo -e "Press ${GREEN}Enter${NC} for default (${DEFAULT_IMAGE_TAG}), or type a version tag:"
 fi
@@ -283,7 +326,6 @@ USER_TAG=$(echo "$USER_TAG" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
 
 if [ -z "$USER_TAG" ]; then
     if [ -n "$CURRENT_CONTAINER_IMAGE" ]; then
-        # Keep using whatever the current container has
         CHOSEN_TAG="${CURRENT_CONTAINER_IMAGE##*:}"
     else
         CHOSEN_TAG="$DEFAULT_IMAGE_TAG"
@@ -297,21 +339,23 @@ echo -e "${CYAN}  Selected: ${DOCKER_IMAGE}${NC}"
 
 # Check if chosen image matches current container -- if so, just reuse it
 if [ "$CURRENT_CONTAINER_IMAGE" = "$DOCKER_IMAGE" ]; then
-    echo -e "${GREEN}[OK] Container already running with ${DOCKER_IMAGE}, reusing.${NC}"
+    echo -e "${GREEN}[OK] Container already using ${DOCKER_IMAGE}, reusing.${NC}"
     sudo docker start "$CONTAINER_NAME" >/dev/null 2>&1 || true
 else
     # Remove old container if it exists (different version)
     if [ -n "$CURRENT_CONTAINER_IMAGE" ]; then
-        echo -e "${YELLOW}[!] Container has ${CURRENT_CONTAINER_IMAGE}, switching to ${DOCKER_IMAGE}${NC}"
-        sudo docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1
+        echo -e "${YELLOW}[!] Switching from ${CURRENT_CONTAINER_IMAGE} to ${DOCKER_IMAGE}${NC}"
+        sudo docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
     fi
 
     # Pull only if image not available locally
-    if ! sudo docker images --format '{{.Repository}}:{{.Tag}}' | grep -q "^${DOCKER_IMAGE}$"; then
-        echo -e "${YELLOW}Pulling ${DOCKER_IMAGE}...${NC}"
+    IMAGE_EXISTS=$(sudo docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
+        | grep "intel/llm-scaler-vllm:${CHOSEN_TAG}" || true)
+    if [ -z "$IMAGE_EXISTS" ]; then
+        echo -e "${YELLOW}Pulling ${DOCKER_IMAGE} (this may take a while)...${NC}"
         sudo docker pull "$DOCKER_IMAGE"
     else
-        echo -e "${GREEN}[OK] Image ${DOCKER_IMAGE} already downloaded.${NC}"
+        echo -e "${GREEN}[OK] Image ${DOCKER_IMAGE} already downloaded locally.${NC}"
     fi
 
     echo -e "${YELLOW}Creating container...${NC}"
