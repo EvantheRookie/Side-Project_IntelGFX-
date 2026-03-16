@@ -1,49 +1,35 @@
-# BMG vLLM Ultimate Control Center (Intel Arc Battlemage)
+# BMG vLLM Benchmark (Intel Arc Battlemage)
 
-A side project for Intel Arc Battlemage (BMG) GPU owners who want to run large language models locally. This all-in-one bash toolkit handles everything from Docker setup and model downloading to serving, benchmarking, and real-time GPU monitoring -- all aligned with the official [Intel llm-scaler-vllm](https://github.com/intel/llm-scaler) specification.
-
-No deep knowledge of vLLM or Docker required -- the script walks you through each step interactively.
+A fully automatic benchmark script for Intel Arc Battlemage (BMG) GPUs, aligned with the official [Intel llm-scaler](https://github.com/intel/llm-scaler) specification. Handles driver detection, Docker setup, model downloading, server launch, and `vllm bench serve` -- all in one go.
 
 ## Features
 
-- **4 Execution Modes** -- Online API + Web GUI, Offline Batch, Official Intel Benchmark, GPU Monitor
-- **Built-in C GPU Monitor** -- real-time VRAM, power, temperature, fan speed, PCIe link info via `xpu-smi`
-- **Smart max-model-len Calculator** -- auto-profiles VRAM, quantization, and model size to recommend optimal context length
-- **Intel Spec Compliant** -- server parameters match the official [llm-scaler README](https://github.com/intel/llm-scaler/blob/main/vllm/README.md) exactly
+- **Fully Automatic** -- one script from zero to benchmark results
+- **Smart VRAM Detection** -- reads actual MiB from `xpu-smi`, converts accurately (no rounding errors)
+- **Auto max-model-len Calculator** -- profiles VRAM and model size to calculate optimal context length
+- **Model Compatibility Check** -- validates model architecture against container's vLLM before starting
+- **Intel Spec Compliant** -- server and benchmark parameters match the [llm-scaler README](https://github.com/intel/llm-scaler/blob/main/vllm/README.md) exactly
+- **Crash Detection** -- detects server crashes during startup and dumps logs immediately
 
 ## Prerequisites
 
 | Requirement | Details |
 |---|---|
-| **Hardware** | Intel Arc discrete GPU (Battlemage B60) |
+| **Hardware** | Intel Arc discrete GPU (Battlemage B580/B570) |
 | **OS** | Linux with Intel GPU drivers installed (`xpu-smi` must be available) |
 | **Docker** | Docker Engine with GPU passthrough support |
-| **Git + git-lfs** | Required for downloading models from HuggingFace (`sudo apt install git-lfs && git lfs install`) |
-| **GCC** | Required only for the C GPU monitor (optional) |
-| **Python 3** | Required only for Mode 1 (Gradio Web GUI) |
+| **Git + git-lfs** | Required for downloading models from HuggingFace |
 
 ## Tested Hardware & Models
 
-**GPU:** Intel Battlemage (BMG) series
-
-**Models successfully tested:**
+**GPU:** Intel Arc B580 (12 GiB VRAM)
 
 | Model | Size | Status |
 |---|---|---|
 | DeepSeek-R1-Distill-Qwen-7B | 7B | Working |
 | Qwen2.5-14B-Instruct | 14B | Working |
 
-> Other HuggingFace models should work as long as they fit in VRAM. The smart profiler will calculate whether a model fits before launching.
-
-### Driver Installation
-
-Intel Arc GPU drivers must be installed before running the script. If `xpu-smi` is not found, the script will prompt for an offline installer path or direct you to install drivers manually.
-
-Verify your driver installation:
-
-```bash
-xpu-smi discovery
-```
+> Other HuggingFace models should work as long as they fit in VRAM and their architecture is supported by the container's vLLM version.
 
 ## Quick Start
 
@@ -54,104 +40,87 @@ chmod +x bmg_vllm_control.sh
 sudo ./bmg_vllm_control.sh
 ```
 
-The script will guide you through each step interactively.
-
-## How It Works (Step by Step)
+## How It Works
 
 ### Step 1: Driver Check
 
-The script verifies that `xpu-smi` is present. If Intel GPU drivers are missing, it offers to run an offline installer or exits with instructions.
+Verifies `xpu-smi` is installed. Exits with instructions if not found.
 
-### Step 2: Docker Setup
+### Step 2: GPU Detection
 
-Pulls the official `intel/llm-scaler-vllm` Docker image and creates a container named `lsv-container`.
+Detects GPU count and VRAM per GPU using `xpu-smi discovery`. Parses the actual "Memory Physical Size" value in MiB and converts to GiB.
 
-```
-Container config:
-  --privileged --net=host --device=/dev/dri
-  -v /home/intel/LLM:/llm/models/
-  --shm-size="32g"
-```
+### Step 3: Docker Setup
 
-> **Note:** The Intel README recommends using a specific release version tag (e.g. `0.6.6.post1`) rather than `latest`. The script will prompt you for the version.
-
-### Step 3: Model Selection
-
-Lists models already in `/home/intel/LLM/`. To download a new model, paste the `git clone` command straight from HuggingFace:
+Pulls the `intel/llm-scaler-vllm:0.14.0-b8.1` container image and creates a container with the required configuration:
 
 ```
-Model: git clone https://huggingface.co/Qwen/Qwen3.5-9B
+--privileged --net=host --device=/dev/dri
+-v /home/intel/LLM:/llm/models/
+--shm-size="32g"
 ```
 
-Or enter a local folder name if the model is already downloaded:
+If a container already exists with a different image version, it is automatically replaced.
 
-```
-Model: Qwen3.5-9B
-```
+### Step 4: Model Selection
 
-| Format | Example | What happens |
+Lists models already in `/home/intel/LLM/`. You can paste a `git clone` command or enter a local folder name:
+
+| Input | Example | What happens |
 |---|---|---|
-| git clone command | `git clone https://huggingface.co/Qwen/Qwen3.5-9B` | Clones the model to `/home/intel/LLM/Qwen3.5-9B` |
-| Local folder name | `Qwen3.5-9B` | Uses existing folder (no download) |
+| git clone URL | `git clone https://huggingface.co/Qwen/Qwen2.5-7B` | Clones to `/home/intel/LLM/Qwen2.5-7B` |
+| HuggingFace URL | `https://huggingface.co/Qwen/Qwen2.5-7B` | Clones to `/home/intel/LLM/Qwen2.5-7B` |
+| Local folder | `Qwen2.5-7B` | Uses existing folder |
 
-Models are cloned to `/home/intel/LLM/<model_name>` on the host, which is already mounted into the container. If the folder already exists, the download is skipped automatically.
+`git-lfs` is auto-installed if missing.
 
-> **git-lfs** is required for downloading HuggingFace models. The script will auto-install it if missing.
+### Step 5: Model Compatibility Check
 
-### Step 4: Hardware Profiling
+Reads the model's `config.json`, extracts the architecture, and checks if the container's vLLM supports it. Fails early with a clear error if the architecture is unsupported.
 
-The script automatically:
-1. Detects the number of Intel GPUs and VRAM per GPU
-2. Reads model size (e.g. `7B`) and quantization (e.g. `INT4`, `FP8`) from the model name
-3. Calculates the recommended `max-model-len` using:
+### Step 6: Auto-Profiling & max-model-len
 
-```
-model_mem_GB  = params_B x (quant_bits / 8) x 1.05
-kv_per_tok_MB = params_B x 0.20
-kv_avail_GB   = (vram x gpus x 0.90) - model_mem_GB
-max_len       = (kv_avail_GB x 1024) / kv_per_tok_MB
-Clamped to [2048 .. 131072], rounded to nearest 512
-```
-
-You can accept the recommendation or enter a custom value.
-
-### Step 5: Mode Selection
+Calculates optimal `max-model-len` based on:
+- Model parameter count (extracted from model name)
+- FP8 quantization (1 byte per parameter)
+- Available VRAM (90% utilization)
 
 ```
-1) Online API + Web GUI      (Live Chat + Stress Test)
-2) Offline Batch Inference    (.txt / .csv max throughput)
-3) Official Intel Benchmark   (vllm bench serve)
-4) GPU Hardware Monitor       (BMG live dashboard)
+model_mem   = params_B * 1.05 GB (FP8 + overhead)
+kv_per_tok  = params_B * 0.10 MB
+available   = VRAM * 0.9 - model_mem
+max_len     = available / kv_per_tok
+Clamped to [2048..32768], rounded to 512
 ```
 
-## Execution Modes
+### Step 7: vLLM Server Launch
 
-### Mode 1: Online API + Web GUI
+Starts the server with all Intel-spec-required flags:
 
-Starts the vLLM server and launches a Gradio web interface with two tabs:
-
-- **Live Chat** -- streaming chat with TTFT and tokens/sec metrics displayed after each response
-- **Stress Benchmark** -- configurable concurrency, request count, max tokens, and custom prompt
-
-Requires `gradio` and `openai` Python packages (auto-installed).
-
+```bash
+VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
+VLLM_WORKER_MULTIPROC_METHOD=spawn \
+vllm serve /llm/models/<MODEL> \
+    --served-model-name <MODEL> \
+    --dtype float16 \
+    --enforce-eager \
+    --trust-remote-code \
+    --disable-sliding-window \
+    --gpu-memory-util 0.9 \
+    --max-num-batched-tokens 8192 \
+    --disable-log-requests \
+    --max-model-len <calculated> \
+    --block-size 64 \
+    --quantization fp8 \
+    --port 8000 \
+    --host 0.0.0.0
 ```
-Default ports:
-  API Server : 8000
-  Web GUI    : 7860
-```
 
-### Mode 2: Offline Batch Inference
+Waits for the server to respond on `/v1/models` with crash detection and progress reporting.
 
-Runs vLLM offline (no server) for maximum throughput on a batch of prompts.
+### Step 8: Benchmark
 
-- Place a text file (one prompt per line) in `/home/intel/LLM/`
-- Or use the built-in test prompts
-- Outputs per-prompt results and a summary with total tokens/sec
-
-### Mode 3: Official Intel Benchmark
-
-Runs `vllm bench serve` matching the exact command from the [Intel llm-scaler README](https://github.com/intel/llm-scaler/blob/main/vllm/README.md):
+Runs `vllm bench serve` matching the Intel llm-scaler spec:
 
 ```bash
 vllm bench serve \
@@ -162,123 +131,64 @@ vllm bench serve \
     --random-output-len 512 \
     --ignore-eos \
     --num-prompt 10 \
-    --trust-remote-code \
+    --trust_remote_code \
     --request-rate inf \
     --backend vllm \
     --port 8000
 ```
 
-**Configurable parameters:**
-| Parameter | Default | Description |
-|---|---|---|
-| Input token length | 1024 | Length of random input prompts |
-| Output token length | 512 | Max output tokens per request |
-| Number of prompts | 10 | Total benchmark requests |
-| Request rate | inf | Requests per second (`inf` = send all at once) |
+Input/output lengths are auto-clamped if they exceed `max-model-len - 256`.
 
-The script auto-clamps input+output to fit within `max-model-len` minus chat-template overhead.
-
-### Mode 4: GPU Hardware Monitor
-
-Launches the built-in C monitor as a standalone dashboard. Displays per-GPU:
-
-```
-=================================================================
- BMG Monitor Dashboard (Battlemage Intel ARC)
-=================================================================
- [GPU 0] card0 | PCIe: 0000:03:00.0 | hwmon0
-  +-- Root Port : 0000:00:01.0   | PCIe Link: 16 GT/s x16
-  +-- GPU Render Usage :   45.2 %    | Core Freq :  2350 MHz
-  +-- VRAM Usage       :   72.3 %    | VRAM Free :   4480 MiB
-  +-- GPU Power        :  120.50 W   | Temp      :   62.0 C
-  +-- Fan Speed        :   1200 RPM
-=================================================================
-```
-
-The monitor is also available as a tmux split pane in Modes 1 and 3.
-
-## vLLM Server Parameters (Intel Spec)
-
-The server is started with all parameters required by the Intel llm-scaler specification:
-
-```bash
-VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
-VLLM_WORKER_MULTIPROC_METHOD=spawn \
-vllm serve /llm/models/<MODEL> \
-    --served-model-name <MODEL> \
-    --dtype float16 \
-    --max-model-len <calculated> \
-    --port 8000 \
-    --host 0.0.0.0 \
-    --enforce-eager \
-    --trust-remote-code \
-    --gpu-memory-util 0.9 \
-    --block-size 64 \
-    --disable-sliding-window \
-    --max-num-batched-tokens <max-model-len> \
-    --disable-log-requests \
-    -tp <gpu_count>
-```
+## Server Flags Reference
 
 | Flag | Purpose |
 |---|---|
-| `--dtype float16` | Explicit FP16 weight dtype for Intel XPU |
+| `--dtype float16` | FP16 weight dtype for Intel XPU |
 | `--enforce-eager` | Disables XPU graph compilation (prevents hangs) |
 | `--block-size 64` | Intel-specific KV cache block size |
 | `--disable-sliding-window` | Required by Intel spec |
 | `--gpu-memory-util 0.9` | Use 90% of available VRAM |
+| `--quantization fp8` | FP8 online quantization |
 | `-tp N` | Tensor parallelism across N GPUs (auto-detected) |
-| `VLLM_WORKER_MULTIPROC_METHOD=spawn` | Required for Intel XPU multi-process workers |
-| `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1` | Permits large context windows |
 
 ## File Structure
 
 ```
 .
-└── bmg_vllm_control.sh    # Main script (self-contained)
+└── bmg_vllm_control.sh    # Main script (self-contained, ~310 lines)
 ```
-
-The script is fully self-contained. It embeds the C GPU monitor source code and compiles it on first run to `/usr/local/bin/bmg_monitor`.
 
 ## Runtime Paths
 
 | Path | Description |
 |---|---|
-| `/home/intel/LLM/` | Host model storage (mounted into container as `/llm/models/`) |
-| `/usr/local/bin/bmg_monitor` | Compiled GPU monitor binary |
-| `/tmp/bmg_monitor.c` | GPU monitor C source (auto-generated) |
+| `/home/intel/LLM/` | Host model storage (mounted as `/llm/models/` in container) |
 | `/tmp/vllm_server.log` | vLLM server log (inside container) |
-| `/tmp/bmg_monitor.log` | Monitor log (fallback when no tmux/GUI terminal) |
 
 ## Troubleshooting
 
 ### Server fails to start / times out
-- Check the server log: `sudo docker exec lsv-container tail -50 /tmp/vllm_server.log`
+- Check the log: `sudo docker exec lsv-container tail -50 /tmp/vllm_server.log`
+- The script auto-dumps the full log on crash detection
 - Reduce `max-model-len` if you see OOM errors
-- Ensure no other vLLM process is running: `sudo docker exec lsv-container pkill -f "vllm serve"`
 
 ### xpu-smi not found
 - Install Intel GPU drivers: [Intel Arc GPU Driver Guide](https://dgpu-docs.intel.com/)
 - Verify with: `xpu-smi discovery`
 
-### Monitor shows N/A for all values
-- The monitor requires `sudo` for `/sys/kernel/debug/` access
-- Ensure `xpu-smi` is installed and functional
-
-### Benchmark input+output exceeds context
-- The script auto-clamps token lengths to fit within `max-model-len`
-- Reduce input/output lengths manually if needed
+### Model architecture not supported
+- The container's vLLM version may not support newer model architectures
+- Use a supported model or pull a newer container tag from [llm-scaler Releases](https://github.com/intel/llm-scaler/blob/main/Releases.md)
 
 ### Docker image version
-- The Intel README recommends pinning to a specific release version
-- Check releases at: https://github.com/intel/llm-scaler/releases
+- The script uses `0.14.0-b8.1` by default (latest beta)
+- Check releases at: https://github.com/intel/llm-scaler/blob/main/Releases.md
 
 ## Known Issues & Limitations
 
-- **Multi-GPU tensor parallelism not fully tested** -- the script auto-detects multiple GPUs and sets `-tp`, but edge cases may exist. Single-GPU setups are the primary tested configuration.
-- **First server start is slow** -- vLLM needs to load the full model into VRAM on cold start. This is normal and can take several minutes for larger models.
-- **VRAM is the bottleneck** -- models that exceed available VRAM will fail to load. Use the smart profiler recommendation or reduce `max-model-len` manually.
-- **Newest models need transformers upgrade** -- the Docker container's `transformers` library may be too old for very new model architectures (e.g. `qwen3_5`). The script auto-upgrades `transformers` on each run to handle this.
+- **Multi-GPU tensor parallelism not fully tested** -- single-GPU is the primary tested configuration
+- **First server start is slow** -- model loading into VRAM can take several minutes
+- **VRAM is the bottleneck** -- models that exceed available VRAM will fail to load
 
 ## Author
 
@@ -287,6 +197,7 @@ The script is fully self-contained. It embeds the C GPU monitor source code and 
 ## References
 
 - [Intel llm-scaler vLLM](https://github.com/intel/llm-scaler/blob/main/vllm/README.md) -- Official Intel benchmark and serving guide
+- [Intel llm-scaler Releases](https://github.com/intel/llm-scaler/blob/main/Releases.md) -- Container version releases
 - [vLLM Documentation](https://docs.vllm.ai/) -- vLLM project docs
 - [Intel Arc GPU Drivers](https://dgpu-docs.intel.com/) -- Driver installation guides
 
