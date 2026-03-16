@@ -15,7 +15,7 @@ No deep knowledge of vLLM or Docker required -- the script walks you through eac
 
 | Requirement | Details |
 |---|---|
-| **Hardware** | Intel Arc discrete GPU (Battlemage B580, B770, or compatible) |
+| **Hardware** | Intel Arc discrete GPU (Battlemage B60) |
 | **OS** | Linux with Intel GPU drivers installed (`xpu-smi` must be available) |
 | **Docker** | Docker Engine with GPU passthrough support |
 | **Git + git-lfs** | Required for downloading models from HuggingFace (`sudo apt install git-lfs && git lfs install`) |
