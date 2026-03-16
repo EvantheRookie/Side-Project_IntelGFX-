@@ -519,6 +519,38 @@ if [ ! -d "/home/intel/LLM/${MODEL_NAME}" ]; then
     echo -e "${RED}[!] /home/intel/LLM/${MODEL_NAME} does not exist.${NC}"
     exit 1
 fi
+# Pre-flight: check if the model architecture is supported by this container's vLLM
+echo -e "${YELLOW}[Check] Verifying model compatibility with container vLLM...${NC}"
+MODEL_CHECK=$(sudo docker exec lsv-container python3 -c "
+import json, sys
+try:
+    cfg = json.load(open('/llm/models/${MODEL_NAME}/config.json'))
+    archs = cfg.get('architectures', [])
+    if not archs:
+        print('OK'); sys.exit(0)
+    from vllm.model_executor.models import ModelRegistry
+    supported = ModelRegistry.get_supported_archs()
+    for a in archs:
+        if a not in supported:
+            print('UNSUPPORTED:' + a)
+            sys.exit(0)
+    print('OK')
+except Exception as e:
+    print('WARN:' + str(e))
+" 2>/dev/null || echo "SKIP")
+if [[ "$MODEL_CHECK" == UNSUPPORTED:* ]]; then
+    BAD_ARCH="${MODEL_CHECK#UNSUPPORTED:}"
+    echo -e "${RED}[FAIL] Model architecture '${BAD_ARCH}' is NOT supported by this container's vLLM.${NC}"
+    echo -e "${YELLOW}  This model is too new for the installed vLLM version.${NC}"
+    echo -e "${YELLOW}  Options:${NC}"
+    echo -e "${YELLOW}    1) Use a supported model (e.g. DeepSeek-R1-Distill-Qwen-7B, Qwen2.5-14B-Instruct)${NC}"
+    echo -e "${YELLOW}    2) Upgrade the container: docker pull intel/llm-scaler-vllm:<newer-version>${NC}"
+    exit 1
+elif [[ "$MODEL_CHECK" == OK ]]; then
+    echo -e "${GREEN}[OK] Model architecture supported.${NC}"
+else
+    echo -e "${YELLOW}[WARN] Could not verify model compatibility (continuing anyway).${NC}"
+fi
 # ------------------------------------------------------------------------------
 # STEP 4: Hardware Profiling + Smart Model Len
 # ------------------------------------------------------------------------------
