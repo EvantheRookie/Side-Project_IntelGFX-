@@ -29,31 +29,219 @@ fi
 echo -e "${GREEN}[OK] xpu-smi found.${NC}"
 
 # ==============================================================================
-# STEP 2: Detect GPU and VRAM
+# STEP 2: Detect GPU and VRAM (via sysfs + C probe)
 # ==============================================================================
 echo -e "\n${CYAN}--- GPU Detection ---${NC}"
-GPU_COUNT=$(xpu-smi discovery 2>/dev/null | grep -c "Device ID" || echo "0")
-[ "$GPU_COUNT" -eq 0 ] && GPU_COUNT=1
 
-# Parse VRAM from xpu-smi: look for "Memory Physical Size" line, extract MiB value
-VRAM_MIB=$(xpu-smi discovery 2>/dev/null \
-    | grep -i "memory physical size" | head -1 \
-    | grep -oP '[\d.]+(?=\s*MiB)' || echo "")
+BMG_DETECT_SRC="/tmp/bmg_gpu_detect.c"
+BMG_DETECT_BIN="/tmp/bmg_gpu_detect"
 
-if [ -n "$VRAM_MIB" ]; then
-    # Convert MiB to GiB (integer), e.g. 12281.75 MiB -> 12 GiB
-    VRAM_GIB=$(awk "BEGIN{printf \"%d\", $VRAM_MIB / 1024}")
-else
-    # Fallback: try to get from sysfs
-    VRAM_GIB=$(xpu-smi discovery 2>/dev/null \
-        | grep -i "memory physical size" | head -1 \
-        | grep -oP '[\d.]+(?=\s*GiB)' \
-        | awk '{printf "%d", $1}' || echo "12")
-    [ -z "$VRAM_GIB" ] && VRAM_GIB=12
+# Compile the GPU detection helper (reads real PCIe addresses and VRAM from sysfs)
+cat > "$BMG_DETECT_SRC" << 'CEOF'
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <limits.h>
+#include <dirent.h>
+
+#define MAX_GPUS 8
+
+typedef struct {
+    char card_name[16];
+    char pci_id[64];
+    char root_port[64];
+    char pci_speed[16];
+    char pci_width[16];
+    char hwmon_dir[64];
+    long long vram_size_bytes;
+} GPUInfo;
+
+int main() {
+    GPUInfo gpus[MAX_GPUS];
+    int gpu_count = 0;
+
+    for (int i = 0; i < 32 && gpu_count < MAX_GPUS; i++) {
+        char vendor_path[256];
+        snprintf(vendor_path, sizeof(vendor_path), "/sys/class/drm/card%d/device/vendor", i);
+        FILE *fp = fopen(vendor_path, "r");
+        if (!fp) continue;
+        char vendor[16] = {0};
+        fscanf(fp, "%s", vendor);
+        fclose(fp);
+
+        if (strcmp(vendor, "0x8086") != 0) continue;
+
+        char device_link[256], resolved_path[PATH_MAX];
+        snprintf(device_link, sizeof(device_link), "/sys/class/drm/card%d/device", i);
+        if (realpath(device_link, resolved_path) == NULL) continue;
+
+        GPUInfo *gpu = &gpus[gpu_count];
+        snprintf(gpu->card_name, sizeof(gpu->card_name), "card%d", i);
+
+        /* Extract PCI BDF from resolved sysfs path (last component) */
+        char *last_slash = strrchr(resolved_path, '/');
+        if (last_slash) strcpy(gpu->pci_id, last_slash + 1);
+        else strcpy(gpu->pci_id, "Unknown");
+
+        /* Top-down parse: extract Root Port from sysfs path
+         * e.g. /sys/devices/pci0000:00/0000:00:01.0/0000:01:00.0/... */
+        strcpy(gpu->root_port, "Unknown");
+        char *pci_str = strstr(resolved_path, "/pci");
+        if (pci_str) {
+            char *first_slash = strchr(pci_str + 1, '/');
+            if (first_slash) {
+                char *rp_start = first_slash + 1;
+                char *rp_end = strchr(rp_start, '/');
+                if (rp_end && (rp_end - rp_start < (int)sizeof(gpu->root_port))) {
+                    strncpy(gpu->root_port, rp_start, rp_end - rp_start);
+                    gpu->root_port[rp_end - rp_start] = '\0';
+                }
+            }
+        }
+
+        /* Read PCIe link speed and width from root port (fallback to device) */
+        char path_buf[256];
+        FILE *fs;
+
+        snprintf(path_buf, sizeof(path_buf), "/sys/bus/pci/devices/%s/current_link_speed", gpu->root_port);
+        fs = fopen(path_buf, "r");
+        if (!fs) {
+            snprintf(path_buf, sizeof(path_buf), "/sys/bus/pci/devices/%s/current_link_speed", gpu->pci_id);
+            fs = fopen(path_buf, "r");
+        }
+        if (fs) { fgets(gpu->pci_speed, sizeof(gpu->pci_speed), fs); gpu->pci_speed[strcspn(gpu->pci_speed, "\n")] = 0; fclose(fs); }
+        else strcpy(gpu->pci_speed, "N/A");
+
+        snprintf(path_buf, sizeof(path_buf), "/sys/bus/pci/devices/%s/current_link_width", gpu->root_port);
+        fs = fopen(path_buf, "r");
+        if (!fs) {
+            snprintf(path_buf, sizeof(path_buf), "/sys/bus/pci/devices/%s/current_link_width", gpu->pci_id);
+            fs = fopen(path_buf, "r");
+        }
+        if (fs) { fgets(gpu->pci_width, sizeof(gpu->pci_width), fs); gpu->pci_width[strcspn(gpu->pci_width, "\n")] = 0; fclose(fs); }
+        else strcpy(gpu->pci_width, "N/A");
+
+        /* Find hwmon directory */
+        char hwmon_base[256];
+        snprintf(hwmon_base, sizeof(hwmon_base), "/sys/class/drm/card%d/device/hwmon/", i);
+        DIR *dir = opendir(hwmon_base);
+        gpu->hwmon_dir[0] = '\0';
+        if (dir) {
+            struct dirent *entry;
+            while ((entry = readdir(dir)) != NULL) {
+                if (strncmp(entry->d_name, "hwmon", 5) == 0) {
+                    strcpy(gpu->hwmon_dir, entry->d_name);
+                    break;
+                }
+            }
+            closedir(dir);
+        }
+
+        /* Read real VRAM size from /sys/kernel/debug/dri/<pci_id>/vram0_mm */
+        gpu->vram_size_bytes = -1;
+        char vram_path[256];
+        snprintf(vram_path, sizeof(vram_path), "/sys/kernel/debug/dri/%s/vram0_mm", gpu->pci_id);
+        FILE *fp_vram = fopen(vram_path, "r");
+        if (fp_vram) {
+            char line[256];
+            while (fgets(line, sizeof(line), fp_vram)) {
+                long long val;
+                if (strstr(line, "size:") && sscanf(strstr(line, "size:"), "size: %lld", &val) == 1) {
+                    gpu->vram_size_bytes = val;
+                    break;
+                }
+            }
+            fclose(fp_vram);
+        }
+
+        gpu_count++;
+    }
+
+    if (gpu_count == 0) {
+        fprintf(stderr, "No Intel GPUs found.\n");
+        return 1;
+    }
+
+    /* Sort by PCI BDF address */
+    for (int i = 0; i < gpu_count - 1; i++) {
+        for (int j = 0; j < gpu_count - i - 1; j++) {
+            if (strcmp(gpus[j].pci_id, gpus[j+1].pci_id) > 0) {
+                GPUInfo temp = gpus[j];
+                gpus[j] = gpus[j+1];
+                gpus[j+1] = temp;
+            }
+        }
+    }
+
+    /* Output structured data for bash parsing:
+     * GPU_COUNT=N
+     * GPU:<index>|<card>|<pci_id>|<root_port>|<speed>|<width>|<hwmon>|<vram_bytes> */
+    printf("GPU_COUNT=%d\n", gpu_count);
+    for (int i = 0; i < gpu_count; i++) {
+        printf("GPU:%d|%s|%s|%s|%s|%s|%s|%lld\n", i,
+               gpus[i].card_name, gpus[i].pci_id, gpus[i].root_port,
+               gpus[i].pci_speed, gpus[i].pci_width,
+               gpus[i].hwmon_dir[0] ? gpus[i].hwmon_dir : "N/A",
+               gpus[i].vram_size_bytes);
+    }
+    return 0;
+}
+CEOF
+
+if ! command -v gcc &>/dev/null; then
+    echo -e "${RED}[FAIL] gcc not found. Install with: sudo apt install build-essential${NC}"
+    exit 1
 fi
 
-echo -e "${GREEN}[OK] ${GPU_COUNT} Intel GPU(s), ${VRAM_GIB} GiB VRAM each.${NC}"
-xpu-smi discovery 2>/dev/null | grep -E "Device Name|Device ID|Memory" | head -6 || true
+gcc -O2 -o "$BMG_DETECT_BIN" "$BMG_DETECT_SRC" 2>/dev/null
+if [ ! -x "$BMG_DETECT_BIN" ]; then
+    echo -e "${RED}[FAIL] Failed to compile GPU detection helper.${NC}"
+    exit 1
+fi
+
+# Run detection (needs sudo for /sys/kernel/debug access)
+DETECT_OUTPUT=$(sudo "$BMG_DETECT_BIN" 2>/dev/null) || {
+    echo -e "${RED}[FAIL] No Intel GPUs detected.${NC}"
+    exit 1
+}
+
+GPU_COUNT=$(echo "$DETECT_OUTPUT" | grep '^GPU_COUNT=' | cut -d= -f2)
+[ -z "$GPU_COUNT" ] || [ "$GPU_COUNT" -eq 0 ] && { echo -e "${RED}[FAIL] No Intel GPUs detected.${NC}"; exit 1; }
+
+# Parse first GPU's VRAM (bytes -> MiB -> GiB)
+# All GPUs are assumed to have the same VRAM for max-model-len calculation
+VRAM_BYTES=$(echo "$DETECT_OUTPUT" | grep '^GPU:0|' | cut -d'|' -f8)
+if [ -n "$VRAM_BYTES" ] && [ "$VRAM_BYTES" -gt 0 ] 2>/dev/null; then
+    VRAM_MIB=$(( VRAM_BYTES / 1048576 ))
+    VRAM_GIB=$(( VRAM_BYTES / 1073741824 ))
+    [ "$VRAM_GIB" -eq 0 ] && VRAM_GIB=1
+else
+    # Fallback: try xpu-smi
+    VRAM_MIB_STR=$(xpu-smi discovery 2>/dev/null \
+        | grep -i "memory physical size" | head -1 \
+        | grep -oP '[\d.]+(?=\s*MiB)' || echo "")
+    if [ -n "$VRAM_MIB_STR" ]; then
+        VRAM_MIB=$(printf "%.0f" "$VRAM_MIB_STR")
+        VRAM_GIB=$(( VRAM_MIB / 1024 ))
+    else
+        VRAM_MIB=12288
+        VRAM_GIB=12
+    fi
+fi
+
+# Display all detected GPUs
+echo -e "${GREEN}[OK] ${GPU_COUNT} Intel GPU(s) detected:${NC}"
+while IFS='|' read -r _idx card pci_id root_port speed width hwmon vram_b; do
+    idx="${_idx#GPU:}"
+    if [ "$vram_b" -gt 0 ] 2>/dev/null; then
+        v_mib=$(( vram_b / 1048576 ))
+        echo -e "  [GPU ${idx}] ${card} | PCIe: ${pci_id} | Root Port: ${root_port} | Link: ${speed} x${width} | VRAM: ${v_mib} MiB"
+    else
+        echo -e "  [GPU ${idx}] ${card} | PCIe: ${pci_id} | Root Port: ${root_port} | Link: ${speed} x${width} | VRAM: (debug access required)"
+    fi
+done < <(echo "$DETECT_OUTPUT" | grep '^GPU:')
+echo -e "  ${CYAN}Total VRAM per GPU: ${VRAM_MIB} MiB (${VRAM_GIB} GiB)${NC}"
 
 # ==============================================================================
 # STEP 3: Docker setup

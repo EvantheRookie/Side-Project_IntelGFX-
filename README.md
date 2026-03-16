@@ -5,7 +5,7 @@ A fully automatic benchmark script for Intel Arc Battlemage (BMG) GPUs, aligned 
 ## Features
 
 - **Fully Automatic** -- one script from zero to benchmark results
-- **Smart VRAM Detection** -- reads actual MiB from `xpu-smi`, converts accurately (no rounding errors)
+- **C-based GPU Detection** -- reads real PCIe addresses, root ports, link speed/width, and VRAM directly from sysfs (`/sys/kernel/debug/dri/<pci_id>/vram0_mm`)
 - **Auto max-model-len Calculator** -- profiles VRAM and model size to calculate optimal context length
 - **Model Compatibility Check** -- validates model architecture against container's vLLM before starting
 - **Intel Spec Compliant** -- server and benchmark parameters match the [llm-scaler README](https://github.com/intel/llm-scaler/blob/main/vllm/README.md) exactly
@@ -18,6 +18,7 @@ A fully automatic benchmark script for Intel Arc Battlemage (BMG) GPUs, aligned 
 | **Hardware** | Intel Arc discrete GPU (Battlemage B580/B570) |
 | **OS** | Linux with Intel GPU drivers installed (`xpu-smi` must be available) |
 | **Docker** | Docker Engine with GPU passthrough support |
+| **GCC** | Required for compiling the GPU detection helper (`sudo apt install build-essential`) |
 | **Git + git-lfs** | Required for downloading models from HuggingFace |
 
 ## Tested Hardware & Models
@@ -46,9 +47,21 @@ sudo ./bmg_vllm_control.sh
 
 Verifies `xpu-smi` is installed. Exits with instructions if not found.
 
-### Step 2: GPU Detection
+### Step 2: GPU Detection (C probe via sysfs)
 
-Detects GPU count and VRAM per GPU using `xpu-smi discovery`. Parses the actual "Memory Physical Size" value in MiB and converts to GiB.
+Compiles and runs an embedded C helper that scans `/sys/class/drm/cardN/device/vendor` for Intel GPUs (`0x8086`). For each GPU it detects:
+
+- **PCIe BDF address** -- resolved from `/sys/class/drm/cardN/device` symlink
+- **Root Port** -- parsed top-down from the sysfs device path (e.g. `0000:00:01.0`)
+- **PCIe link speed & width** -- read from root port's `current_link_speed` / `current_link_width`
+- **Real VRAM size** -- read from `/sys/kernel/debug/dri/<pci_id>/vram0_mm` (requires sudo)
+
+Falls back to `xpu-smi discovery` if debug filesystem is not accessible.
+
+Example output:
+```
+[GPU 0] card0 | PCIe: 0000:03:00.0 | Root Port: 0000:00:01.0 | Link: 16 GT/s x16 | VRAM: 12288 MiB
+```
 
 ### Step 3: Docker Setup
 
@@ -155,7 +168,7 @@ Input/output lengths are auto-clamped if they exceed `max-model-len - 256`.
 
 ```
 .
-└── bmg_vllm_control.sh    # Main script (self-contained, ~310 lines)
+└── bmg_vllm_control.sh    # Main script (self-contained, ~500 lines, embeds C GPU detector)
 ```
 
 ## Runtime Paths
@@ -163,6 +176,8 @@ Input/output lengths are auto-clamped if they exceed `max-model-len - 256`.
 | Path | Description |
 |---|---|
 | `/home/intel/LLM/` | Host model storage (mounted as `/llm/models/` in container) |
+| `/tmp/bmg_gpu_detect.c` | GPU detection C source (auto-generated) |
+| `/tmp/bmg_gpu_detect` | Compiled GPU detection binary |
 | `/tmp/vllm_server.log` | vLLM server log (inside container) |
 
 ## Troubleshooting
