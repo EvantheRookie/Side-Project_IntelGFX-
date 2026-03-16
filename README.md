@@ -278,6 +278,7 @@ The script is fully self-contained. It embeds the C GPU monitor source code and 
 - **Multi-GPU tensor parallelism not fully tested** -- the script auto-detects multiple GPUs and sets `-tp`, but edge cases may exist. Single-GPU setups are the primary tested configuration.
 - **First server start is slow** -- vLLM needs to load the full model into VRAM on cold start. This is normal and can take several minutes for larger models.
 - **VRAM is the bottleneck** -- models that exceed available VRAM will fail to load. Use the smart profiler recommendation or reduce `max-model-len` manually.
+- **Newest models need transformers upgrade** -- the Docker container's `transformers` library may be too old for very new model architectures (e.g. `qwen3_5`). The script auto-upgrades `transformers` on each run to handle this.
 
 ## Author
 

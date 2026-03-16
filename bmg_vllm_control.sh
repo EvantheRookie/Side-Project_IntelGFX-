@@ -361,8 +361,9 @@ calculate_model_len() {
     fi
     # --- Model size in billions ---
     local param_b
+    # Use tail -1 to pick the LAST B-suffixed number (e.g. "Qwen3.5-0.5B" -> 0.5)
     param_b=$(echo "$model_name" | grep -ioE '[0-9]+(\.[0-9]+)?[bB]' \
-              | grep -ioE '[0-9]+(\.[0-9]+)?' | head -1)
+              | grep -ioE '[0-9]+(\.[0-9]+)?' | tail -1)
     param_b=${param_b:-7}
     param_b=$(awk "BEGIN{printf \"%.0f\", $param_b}")
     # --- Compute via awk (float arithmetic) ---
@@ -448,6 +449,13 @@ else
     echo -e "${GREEN}[OK] Container ready.${NC}"
     sudo docker start lsv-container >/dev/null
 fi
+# Ensure transformers is up-to-date inside the container.
+# New HuggingFace models (e.g. Qwen3.5) add new architecture types that
+# older transformers versions don't recognize, causing vLLM to crash with:
+#   "model type `qwen3_5` but Transformers does not recognize this architecture"
+echo -e "${YELLOW}[Container] Upgrading transformers (for newest model support)...${NC}"
+sudo docker exec lsv-container pip install --upgrade transformers 2>&1 | tail -1
+echo -e "${GREEN}[OK] Container dependencies up to date.${NC}"
 # ------------------------------------------------------------------------------
 # STEP 3: Model Selection
 # ------------------------------------------------------------------------------
@@ -567,7 +575,7 @@ start_vllm_server() {
     "
     echo -e "${YELLOW}Waiting for server (5 min timeout)...${NC}"
     local n=0
-    while ! curl -s "http://localhost:${port}/v1/models" >/dev/null; do
+    while ! curl -sf "http://localhost:${port}/v1/models" >/dev/null 2>&1; do
         sleep 5; echo -n "."; n=$((n+1))
         if [ $n -ge 60 ]; then
             echo -e "\n${RED}[FAIL] Timeout. Server log:${NC}"
