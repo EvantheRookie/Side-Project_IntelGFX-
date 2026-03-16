@@ -21,16 +21,6 @@ A fully automatic benchmark script for Intel Arc Battlemage (BMG) GPUs, aligned 
 | **GCC** | Required for compiling the GPU detection helper (`sudo apt install build-essential`) |
 | **Git + git-lfs** | Required for downloading models from HuggingFace |
 
-## Tested Hardware & Models
-
-**GPU:** Intel Arc B580 (12 GiB VRAM)
-
-| Model | Size | Status |
-|---|---|---|
-| DeepSeek-R1-Distill-Qwen-7B | 7B | Working |
-| Qwen2.5-14B-Instruct | 14B | Working |
-
-> Other HuggingFace models should work as long as they fit in VRAM and their architecture is supported by the container's vLLM version.
 
 ## Quick Start
 
