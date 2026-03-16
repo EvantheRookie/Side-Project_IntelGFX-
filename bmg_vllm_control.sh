@@ -543,16 +543,24 @@ start_vllm_server() {
     echo -e "${YELLOW}       --enforce-eager  : skip XPU graph compile (prevents hang)${NC}"
     echo -e "${YELLOW}       --block-size 64  : Intel-specific KV cache block size${NC}"
     echo -e "${YELLOW}       SPAWN method     : required for Intel XPU workers${NC}"
-    # BUG FIX: use -t only (not -it) for non-interactive kill command
     sudo docker exec lsv-container pkill -f "vllm serve" 2>/dev/null
     sleep 2
-    # BUG FIX: Added all Intel-spec-required parameters:
-    #   VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 - required for large context windows
-    #   --dtype float16                  - explicit dtype per Intel spec
-    #   --block-size 64                  - Intel KV cache block size
-    #   --disable-sliding-window         - Intel spec requirement
-    #   --max-num-batched-tokens         - Intel spec requirement
-    #   --host 0.0.0.0                   - explicit bind address
+    # Clear old log
+    sudo docker exec lsv-container bash -c "> /tmp/vllm_server.log"
+    # Detect which optional flags the container's vLLM version supports.
+    # Flags like --disable-sliding-window and --max-num-batched-tokens
+    # don't exist in all versions and cause immediate crash if unsupported.
+    local EXTRA_ARGS=""
+    local VLLM_HELP
+    VLLM_HELP=$(sudo docker exec lsv-container vllm serve --help 2>&1 || true)
+    if echo "$VLLM_HELP" | grep -q "disable-sliding-window"; then
+        EXTRA_ARGS="${EXTRA_ARGS} --disable-sliding-window"
+    fi
+    if echo "$VLLM_HELP" | grep -q "max-num-batched-tokens"; then
+        EXTRA_ARGS="${EXTRA_ARGS} --max-num-batched-tokens ${MODEL_LEN}"
+    fi
+    # Start server in background. Use direct file redirect (not pipe/tee)
+    # so the detached process reliably writes logs.
     sudo docker exec -d lsv-container bash -c "
         source /opt/intel/oneapi/setvars.sh --force 2>/dev/null || true
         VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
@@ -567,18 +575,31 @@ start_vllm_server() {
             --trust-remote-code \
             --gpu-memory-util 0.9 \
             --block-size 64 \
-            --disable-sliding-window \
-            --max-num-batched-tokens ${MODEL_LEN} \
             --disable-log-requests \
             ${TP_ARG} \
-        2>&1 | tee /tmp/vllm_server.log
+            ${EXTRA_ARGS} \
+        > /tmp/vllm_server.log 2>&1
     "
     echo -e "${YELLOW}Waiting for server (5 min timeout)...${NC}"
+    echo -e "${CYAN}    Log: sudo docker exec lsv-container tail -f /tmp/vllm_server.log${NC}"
     local n=0
     while ! curl -sf "http://localhost:${port}/v1/models" >/dev/null 2>&1; do
-        sleep 5; echo -n "."; n=$((n+1))
+        sleep 5; n=$((n+1))
+        # Every 6 ticks (30s) show the last log line so user sees progress
+        if [ $((n % 6)) -eq 0 ]; then
+            echo ""
+            echo -e "${CYAN}  [${n}s] $(sudo docker exec lsv-container tail -1 /tmp/vllm_server.log 2>/dev/null)${NC}"
+        else
+            echo -n "."
+        fi
+        # Detect if the server process crashed (no more infinite dots)
+        if ! sudo docker exec lsv-container pgrep -f "vllm serve" >/dev/null 2>&1; then
+            echo -e "\n${RED}[FAIL] Server process died. Log output:${NC}"
+            sudo docker exec lsv-container cat /tmp/vllm_server.log
+            exit 1
+        fi
         if [ $n -ge 60 ]; then
-            echo -e "\n${RED}[FAIL] Timeout. Server log:${NC}"
+            echo -e "\n${RED}[FAIL] Timeout (5 min). Last 30 lines of server log:${NC}"
             sudo docker exec lsv-container tail -30 /tmp/vllm_server.log
             exit 1
         fi
