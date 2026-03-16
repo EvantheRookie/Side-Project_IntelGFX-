@@ -107,7 +107,7 @@ Performs multiple checks before attempting to start the server:
 | **config.json exists** | Non-HuggingFace model formats |
 | **Architecture supported** | Model arch not in this vLLM version's ModelRegistry |
 | **Model type** | Rerankers, embeddings, classifiers -- not text generation models |
-| **Vision/multimodal** | VL models that crash due to config incompatibilities on XPU |
+| **Vision/multimodal** | Allowed (llm-scaler supports VL); notes benchmark is text-only |
 | **Config loading** | Attribute errors (e.g. missing `tie_word_embeddings`) |
 
 If any check fails, the script exits with a clear error message and suggests compatible models.

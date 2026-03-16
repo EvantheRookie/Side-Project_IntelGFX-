@@ -463,10 +463,12 @@ try:
     model_type = cfg.get('model_type', '').lower()
     arch_str = ' '.join(archs).lower()
 
-    # Reject explicit reranker/classifier/embedding models
+    # Reject non-generation models (rerankers, embeddings, classifiers)
+    # Check both the architecture class names AND the model folder name
+    model_name_lower = os.path.basename(model_dir).lower()
     reject_keywords = ['reranker', 'classifier', 'embedding', 'reward']
     for kw in reject_keywords:
-        if kw in arch_str or kw in model_type:
+        if kw in arch_str or kw in model_type or kw in model_name_lower:
             print(f'BAD_TYPE:This is a {kw} model, not a text generation model')
             sys.exit(0)
 
@@ -476,29 +478,24 @@ try:
             print(f'BAD_TYPE:{a} is a classification model, not for text generation')
             sys.exit(0)
 
-    # --- Check vision/multimodal models: warn about benchmark limitations ---
-    is_multimodal = False
-    mm_keywords = ['VL', 'Vision', 'Visual', 'Image', 'Video']
-    for kw in mm_keywords:
-        if kw.lower() in arch_str or kw.lower() in model_type:
-            is_multimodal = True
-            break
-
-    if is_multimodal:
-        # Vision models may load but random-text benchmark won't test vision
-        # Also many VL models have config bugs with vLLM
-        print(f'WARN_MULTIMODAL:{archs[0] if archs else model_type}')
-        sys.exit(0)
-
     # --- Deep check: try to actually load the config through transformers ---
     # This catches attribute errors like 'tie_word_embeddings' missing
+    # Runs for ALL models including vision/multimodal (which llm-scaler supports)
     try:
         from transformers import AutoConfig
         auto_cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
-        # Try accessing common attributes that vLLM needs
+        # Probe attributes that vLLM accesses during model init
         _ = getattr(auto_cfg, 'tie_word_embeddings', None)
         _ = getattr(auto_cfg, 'hidden_size', None)
         _ = getattr(auto_cfg, 'num_attention_heads', None)
+        # For VL models, also probe the text config if present
+        text_cfg = getattr(auto_cfg, 'text_config', None)
+        if text_cfg is not None:
+            _ = getattr(text_cfg, 'tie_word_embeddings', None)
+            _ = getattr(text_cfg, 'hidden_size', None)
+    except AttributeError as e:
+        print(f'CONFIG_ERROR:{e}')
+        sys.exit(0)
     except Exception as e:
         err_str = str(e)
         if 'attribute' in err_str.lower():
@@ -506,7 +503,13 @@ try:
             sys.exit(0)
         # Other errors (missing tokenizer etc) are less critical, continue
 
-    print('OK')
+    # Note if multimodal (for display only, not a blocker)
+    is_mm = any(kw.lower() in arch_str or kw.lower() in model_type
+                for kw in ['vl', 'vision', 'visual', 'image', 'video'])
+    if is_mm:
+        print('OK_MULTIMODAL')
+    else:
+        print('OK')
 
 except FileNotFoundError:
     print('NO_CONFIG:config.json not found')
@@ -529,14 +532,9 @@ case "$MODEL_CHECK" in
         echo -e "${YELLOW}  Examples: DeepSeek-R1-Distill-Qwen-7B, Qwen2.5-7B-Instruct, Llama-3.1-8B${NC}"
         exit 1
         ;;
-    WARN_MULTIMODAL:*)
-        MM_ARCH="${MODEL_CHECK#WARN_MULTIMODAL:}"
-        echo -e "${RED}[FAIL] '${MM_ARCH}' is a vision/multimodal model.${NC}"
-        echo -e "${YELLOW}  Vision models often crash with vLLM on Intel XPU due to config incompatibilities.${NC}"
-        echo -e "${YELLOW}  The random-text benchmark also cannot test vision capabilities.${NC}"
-        echo -e "${YELLOW}  Use a text-only model instead:${NC}"
-        echo -e "${YELLOW}    DeepSeek-R1-Distill-Qwen-7B, Qwen2.5-7B-Instruct, Llama-3.1-8B${NC}"
-        exit 1
+    OK_MULTIMODAL)
+        echo -e "${GREEN}[OK] Model compatible (vision/multimodal).${NC}"
+        echo -e "${YELLOW}  Note: The random-text benchmark tests text generation only, not vision.${NC}"
         ;;
     CONFIG_ERROR:*)
         CFG_ERR="${MODEL_CHECK#CONFIG_ERROR:}"
