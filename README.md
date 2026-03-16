@@ -97,14 +97,25 @@ Lists models already in `/home/intel/LLM/`. You can paste a `git clone` command 
 
 `git-lfs` is auto-installed if missing.
 
-### Step 5: Model Compatibility Check
+### Step 5: Model Validation (Deep Pre-flight Check)
 
-Reads the model's `config.json`, extracts the architecture, and checks if the container's vLLM supports it. Fails early with a clear error if the architecture is unsupported.
+Performs multiple checks before attempting to start the server:
+
+| Check | What it catches |
+|---|---|
+| **GGUF format** | `.gguf` files -- vLLM on Intel XPU cannot load GGUF models |
+| **config.json exists** | Non-HuggingFace model formats |
+| **Architecture supported** | Model arch not in this vLLM version's ModelRegistry |
+| **Model type** | Rerankers, embeddings, classifiers -- not text generation models |
+| **Vision/multimodal** | VL models that crash due to config incompatibilities on XPU |
+| **Config loading** | Attribute errors (e.g. missing `tie_word_embeddings`) |
+
+If any check fails, the script exits with a clear error message and suggests compatible models.
 
 ### Step 6: Auto-Profiling & max-model-len
 
 Calculates optimal `max-model-len` based on:
-- Model parameter count (extracted from model name)
+- Model parameter count (read from `config.json`, falls back to model name parsing)
 - FP8 quantization (1 byte per parameter)
 - Available VRAM (90% utilization)
 

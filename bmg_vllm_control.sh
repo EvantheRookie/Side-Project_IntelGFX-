@@ -413,42 +413,193 @@ fi
 echo -e "${GREEN}[OK] Model: ${MODEL_NAME}${NC}"
 
 # ==============================================================================
-# STEP 5: Pre-flight model compatibility check
+# STEP 5: Pre-flight model compatibility check (deep validation)
 # ==============================================================================
-echo -e "${YELLOW}Checking model compatibility...${NC}"
-MODEL_CHECK=$(sudo docker exec "$CONTAINER_NAME" python3 -c "
-import json, sys
-try:
-    cfg = json.load(open('/llm/models/${MODEL_NAME}/config.json'))
-    archs = cfg.get('architectures', [])
-    if not archs:
-        print('OK'); sys.exit(0)
-    from vllm.model_executor.models import ModelRegistry
-    supported = ModelRegistry.get_supported_archs()
-    for a in archs:
-        if a not in supported:
-            print('UNSUPPORTED:' + a); sys.exit(0)
-    print('OK')
-except Exception as e:
-    print('WARN:' + str(e))
-" 2>/dev/null || echo "SKIP")
+echo -e "\n${CYAN}--- Model Validation ---${NC}"
+MODEL_PATH="${MODEL_DIR}/${MODEL_NAME}"
 
-if [[ "$MODEL_CHECK" == UNSUPPORTED:* ]]; then
-    BAD_ARCH="${MODEL_CHECK#UNSUPPORTED:}"
-    echo -e "${RED}[FAIL] Architecture '${BAD_ARCH}' not supported by this vLLM container.${NC}"
-    echo -e "${YELLOW}  Use a supported model or upgrade: docker pull intel/llm-scaler-vllm:<newer-tag>${NC}"
+# Check 1: Reject GGUF models (vLLM on Intel XPU does not support GGUF format)
+GGUF_FILES=$(find "$MODEL_PATH" -maxdepth 1 -name '*.gguf' 2>/dev/null | head -1)
+if [ -n "$GGUF_FILES" ]; then
+    echo -e "${RED}[FAIL] This is a GGUF model. vLLM on Intel XPU does not support GGUF format.${NC}"
+    echo -e "${YELLOW}  Download the original HuggingFace (safetensors) version instead.${NC}"
+    echo -e "${YELLOW}  Example: git clone https://huggingface.co/Qwen/Qwen2.5-7B-Instruct${NC}"
     exit 1
 fi
-echo -e "${GREEN}[OK] Model compatible.${NC}"
+
+# Check 2: Must have config.json (standard HuggingFace format)
+if [ ! -f "${MODEL_PATH}/config.json" ]; then
+    echo -e "${RED}[FAIL] No config.json found in ${MODEL_PATH}${NC}"
+    echo -e "${YELLOW}  This doesn't look like a standard HuggingFace model.${NC}"
+    echo -e "${YELLOW}  vLLM requires models in HuggingFace safetensors format.${NC}"
+    exit 1
+fi
+
+# Check 3: Deep validation inside container -- architecture support, model type,
+# and config loading (catches attribute errors like tie_word_embeddings)
+echo -e "${YELLOW}Checking model compatibility...${NC}"
+MODEL_CHECK=$(sudo docker exec "$CONTAINER_NAME" python3 -c "
+import json, sys, os
+
+model_dir = '/llm/models/${MODEL_NAME}'
+result = 'OK'
+detail = ''
+
+try:
+    cfg = json.load(open(os.path.join(model_dir, 'config.json')))
+
+    # --- Check architecture support ---
+    archs = cfg.get('architectures', [])
+    if archs:
+        from vllm.model_executor.models import ModelRegistry
+        supported = ModelRegistry.get_supported_archs()
+        for a in archs:
+            if a not in supported:
+                print(f'UNSUPPORTED_ARCH:{a}')
+                sys.exit(0)
+
+    # --- Check model type: reject non-generation models ---
+    # Rerankers, embeddings, classifiers cannot do text generation
+    model_type = cfg.get('model_type', '').lower()
+    arch_str = ' '.join(archs).lower()
+
+    # Reject explicit reranker/classifier/embedding models
+    reject_keywords = ['reranker', 'classifier', 'embedding', 'reward']
+    for kw in reject_keywords:
+        if kw in arch_str or kw in model_type:
+            print(f'BAD_TYPE:This is a {kw} model, not a text generation model')
+            sys.exit(0)
+
+    # Reject sequence classification models
+    for a in archs:
+        if 'ForSequenceClassification' in a or 'ForTokenClassification' in a:
+            print(f'BAD_TYPE:{a} is a classification model, not for text generation')
+            sys.exit(0)
+
+    # --- Check vision/multimodal models: warn about benchmark limitations ---
+    is_multimodal = False
+    mm_keywords = ['VL', 'Vision', 'Visual', 'Image', 'Video']
+    for kw in mm_keywords:
+        if kw.lower() in arch_str or kw.lower() in model_type:
+            is_multimodal = True
+            break
+
+    if is_multimodal:
+        # Vision models may load but random-text benchmark won't test vision
+        # Also many VL models have config bugs with vLLM
+        print(f'WARN_MULTIMODAL:{archs[0] if archs else model_type}')
+        sys.exit(0)
+
+    # --- Deep check: try to actually load the config through transformers ---
+    # This catches attribute errors like 'tie_word_embeddings' missing
+    try:
+        from transformers import AutoConfig
+        auto_cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+        # Try accessing common attributes that vLLM needs
+        _ = getattr(auto_cfg, 'tie_word_embeddings', None)
+        _ = getattr(auto_cfg, 'hidden_size', None)
+        _ = getattr(auto_cfg, 'num_attention_heads', None)
+    except Exception as e:
+        err_str = str(e)
+        if 'attribute' in err_str.lower():
+            print(f'CONFIG_ERROR:{err_str}')
+            sys.exit(0)
+        # Other errors (missing tokenizer etc) are less critical, continue
+
+    print('OK')
+
+except FileNotFoundError:
+    print('NO_CONFIG:config.json not found')
+except Exception as e:
+    print(f'WARN:{e}')
+" 2>/dev/null || echo "SKIP")
+
+# Handle all result types
+case "$MODEL_CHECK" in
+    UNSUPPORTED_ARCH:*)
+        BAD_ARCH="${MODEL_CHECK#UNSUPPORTED_ARCH:}"
+        echo -e "${RED}[FAIL] Architecture '${BAD_ARCH}' not supported by this vLLM container.${NC}"
+        echo -e "${YELLOW}  Use a supported model or upgrade the container.${NC}"
+        exit 1
+        ;;
+    BAD_TYPE:*)
+        REASON="${MODEL_CHECK#BAD_TYPE:}"
+        echo -e "${RED}[FAIL] ${REASON}${NC}"
+        echo -e "${YELLOW}  The vLLM benchmark requires a text generation (CausalLM) model.${NC}"
+        echo -e "${YELLOW}  Examples: DeepSeek-R1-Distill-Qwen-7B, Qwen2.5-7B-Instruct, Llama-3.1-8B${NC}"
+        exit 1
+        ;;
+    WARN_MULTIMODAL:*)
+        MM_ARCH="${MODEL_CHECK#WARN_MULTIMODAL:}"
+        echo -e "${RED}[FAIL] '${MM_ARCH}' is a vision/multimodal model.${NC}"
+        echo -e "${YELLOW}  Vision models often crash with vLLM on Intel XPU due to config incompatibilities.${NC}"
+        echo -e "${YELLOW}  The random-text benchmark also cannot test vision capabilities.${NC}"
+        echo -e "${YELLOW}  Use a text-only model instead:${NC}"
+        echo -e "${YELLOW}    DeepSeek-R1-Distill-Qwen-7B, Qwen2.5-7B-Instruct, Llama-3.1-8B${NC}"
+        exit 1
+        ;;
+    CONFIG_ERROR:*)
+        CFG_ERR="${MODEL_CHECK#CONFIG_ERROR:}"
+        echo -e "${RED}[FAIL] Model config error: ${CFG_ERR}${NC}"
+        echo -e "${YELLOW}  The model's config.json is incompatible with this container's vLLM/transformers.${NC}"
+        echo -e "${YELLOW}  Try a different model or upgrade the container.${NC}"
+        exit 1
+        ;;
+    NO_CONFIG:*)
+        echo -e "${RED}[FAIL] No config.json in model directory.${NC}"
+        exit 1
+        ;;
+    OK)
+        echo -e "${GREEN}[OK] Model compatible (text generation).${NC}"
+        ;;
+    SKIP|WARN:*)
+        echo -e "${YELLOW}[WARN] Could not fully verify compatibility (continuing anyway).${NC}"
+        ;;
+    *)
+        echo -e "${YELLOW}[WARN] Unexpected check result: ${MODEL_CHECK}${NC}"
+        ;;
+esac
 
 # ==============================================================================
 # STEP 6: Calculate max-model-len
 # ==============================================================================
 echo -e "\n${CYAN}--- Model Profiling ---${NC}"
 
-# Extract param count from model name (e.g. "7B" -> 7)
-PARAM_B=$(echo "$MODEL_NAME" | grep -ioE '[0-9]+(\.[0-9]+)?[bB]' \
-          | grep -ioE '[0-9]+(\.[0-9]+)?' | tail -1)
+# Extract param count: try config.json first, then model name, then default 7
+PARAM_B=""
+# Method 1: Read from config.json (most accurate - uses hidden_size, num_layers, vocab)
+CONFIG_PARAM_B=$(sudo docker exec "$CONTAINER_NAME" python3 -c "
+import json, sys
+try:
+    cfg = json.load(open('/llm/models/${MODEL_NAME}/config.json'))
+    h = cfg.get('hidden_size', 0)
+    n = cfg.get('num_hidden_layers', 0)
+    v = cfg.get('vocab_size', 0)
+    i = cfg.get('intermediate_size', h * 4)
+    if h > 0 and n > 0:
+        # Rough param estimate: embedding + n*(attn + ffn)
+        params = v * h + n * (4 * h * h + 3 * h * i)
+        billions = params / 1e9
+        # Round to nearest common size
+        for s in [0.5, 1, 1.5, 2, 3, 4, 7, 8, 9, 13, 14, 15, 32, 34, 70, 72]:
+            if abs(billions - s) / max(s, 1) < 0.3:
+                print(f'{s}'); sys.exit(0)
+        print(f'{billions:.1f}')
+    else:
+        print('')
+except:
+    print('')
+" 2>/dev/null || true)
+
+if [ -n "$CONFIG_PARAM_B" ]; then
+    PARAM_B="$CONFIG_PARAM_B"
+fi
+
+# Method 2: Parse from model name (e.g. "7B" -> 7)
+if [ -z "$PARAM_B" ]; then
+    PARAM_B=$(echo "$MODEL_NAME" | grep -ioE '[0-9]+(\.[0-9]+)?[bB]' \
+              | grep -ioE '[0-9]+(\.[0-9]+)?' | tail -1 || true)
+fi
 PARAM_B=${PARAM_B:-7}
 
 # With fp8 quantization: 1 byte per param
