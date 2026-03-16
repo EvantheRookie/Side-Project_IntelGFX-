@@ -62,21 +62,26 @@ Container config:
 
 ### Step 3: Model Selection
 
-Lists models already in `/home/intel/LLM/`. You can enter any of these formats:
+Lists models already in `/home/intel/LLM/`. To download a new model, paste the `git clone` command straight from HuggingFace:
+
+```
+Model: git clone https://huggingface.co/Qwen/Qwen3.5-9B
+```
+
+Or enter a local folder name if the model is already downloaded:
+
+```
+Model: Qwen3.5-9B
+```
 
 | Format | Example | What happens |
 |---|---|---|
-| HuggingFace URL | `https://huggingface.co/Qwen/Qwen3.5-9B` | Clones the repo via `git clone` |
-| owner/model | `Qwen/Qwen3.5-9B` | Builds the URL and clones automatically |
+| git clone command | `git clone https://huggingface.co/Qwen/Qwen3.5-9B` | Clones the model to `/home/intel/LLM/Qwen3.5-9B` |
 | Local folder name | `Qwen3.5-9B` | Uses existing folder (no download) |
 
-Models are cloned to `/home/intel/LLM/<model_name>` on the host, which is already mounted into the container.
+Models are cloned to `/home/intel/LLM/<model_name>` on the host, which is already mounted into the container. If the folder already exists, the download is skipped automatically.
 
-> **Requires `git-lfs`:** HuggingFace models use Git LFS for large weight files. Install it first:
-> ```bash
-> sudo apt install git-lfs && git lfs install
-> ```
-> If the model folder already exists, the download is skipped automatically.
+> **git-lfs** is required for downloading HuggingFace models. The script will auto-install it if missing.
 
 ### Step 4: Hardware Profiling
 

@@ -455,14 +455,18 @@ echo -e "\n${CYAN}--- Model Selection ---${NC}"
 echo "Models already in /home/intel/LLM/:"
 ls -1 /home/intel/LLM/ | grep -v '^\.' || echo "(none)"
 echo "----------------------------------------------"
-echo -e "Enter one of:"
-echo -e "  ${GREEN}1)${NC} A HuggingFace URL   (e.g. https://huggingface.co/Qwen/Qwen3.5-9B)"
-echo -e "  ${GREEN}2)${NC} owner/model format   (e.g. Qwen/Qwen3.5-9B)"
-echo -e "  ${GREEN}3)${NC} Local folder name    (e.g. Qwen3.5-9B) if already downloaded"
+echo -e "To download a new model, paste the git clone command from HuggingFace:"
+echo -e "  ${GREEN}git clone https://huggingface.co/Qwen/Qwen3.5-9B${NC}"
+echo -e "Or enter a local folder name if already downloaded:"
+echo -e "  ${GREEN}Qwen3.5-9B${NC}"
 read -p "Model: " USER_INPUT
 
-# Strip trailing slashes
+# Strip trailing slashes and whitespace
+USER_INPUT=$(echo "$USER_INPUT" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
 USER_INPUT="${USER_INPUT%/}"
+
+# Strip "git clone " prefix if user pasted a full git clone command
+USER_INPUT="${USER_INPUT#git clone }"
 
 # Parse input: extract model name and build clone URL
 if [[ "$USER_INPUT" == https://huggingface.co/* ]]; then
@@ -470,10 +474,6 @@ if [[ "$USER_INPUT" == https://huggingface.co/* ]]; then
     REPO_PATH="${USER_INPUT#https://huggingface.co/}"
     MODEL_NAME=$(basename "$REPO_PATH")
     CLONE_URL="$USER_INPUT"
-elif [[ "$USER_INPUT" == *"/"* ]]; then
-    # owner/model format (e.g. Qwen/Qwen3.5-9B)
-    MODEL_NAME=$(basename "$USER_INPUT")
-    CLONE_URL="https://huggingface.co/${USER_INPUT}"
 else
     # Local folder name -- no download needed
     MODEL_NAME="$USER_INPUT"
@@ -485,11 +485,15 @@ if [ -n "$CLONE_URL" ]; then
     if [ -d "/home/intel/LLM/${MODEL_NAME}" ]; then
         echo -e "${GREEN}[OK] /home/intel/LLM/${MODEL_NAME} already exists, skipping download.${NC}"
     else
-        # Check git-lfs is installed (required for HF model weights)
+        # Auto-install git-lfs if missing (required for HF model weights)
         if ! command -v git-lfs &>/dev/null; then
-            echo -e "${RED}[!] git-lfs is not installed. HuggingFace models require it.${NC}"
-            echo -e "${YELLOW}    Install with: sudo apt install git-lfs && git lfs install${NC}"
-            exit 1
+            echo -e "${YELLOW}[!] git-lfs not found. Installing...${NC}"
+            sudo apt install -y git-lfs && git lfs install
+            if [ $? -ne 0 ]; then
+                echo -e "${RED}[FAIL] Could not install git-lfs. Install manually:${NC}"
+                echo -e "${YELLOW}    sudo apt install git-lfs && git lfs install${NC}"
+                exit 1
+            fi
         fi
         echo -e "\n${YELLOW}Cloning ${CLONE_URL} into /home/intel/LLM/${MODEL_NAME} ...${NC}"
         echo -e "${YELLOW}(This may take a while for large models)${NC}"
