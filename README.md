@@ -63,17 +63,32 @@ Example output:
 [GPU 0] card0 | PCIe: 0000:03:00.0 | Root Port: 0000:00:01.0 | Link: 16 GT/s x16 | VRAM: 12288 MiB
 ```
 
-### Step 3: Docker Setup
+### Step 3: Docker Setup (Version Selection)
 
-Pulls the `intel/llm-scaler-vllm:0.14.0-b8.1` container image and creates a container with the required configuration:
+Shows all locally available `intel/llm-scaler-vllm` image versions and the current container's version (if any). You choose which version to use:
 
+- **Press Enter** to keep the current container (no download needed)
+- **Type a version tag** (e.g. `1.3`, `0.14.0-b8.1`) to switch
+
+The script only pulls from Docker Hub if the chosen version isn't already downloaded locally. If switching versions, the old container is automatically replaced.
+
+```
+Locally available versions:
+  * 0.14.0-b8.1  (current container)
+  - 1.3
+Default: 0.14.0-b8.1
+Releases: https://github.com/intel/llm-scaler/blob/main/Releases.md
+
+Press Enter to keep current (0.14.0-b8.1), or type a version tag:
+Version:
+```
+
+Container configuration:
 ```
 --privileged --net=host --device=/dev/dri
 -v /home/intel/LLM:/llm/models/
 --shm-size="32g"
 ```
-
-If a container already exists with a different image version, it is automatically replaced.
 
 ### Step 4: Model Selection
 

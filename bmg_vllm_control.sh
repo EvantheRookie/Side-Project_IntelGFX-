@@ -244,26 +244,76 @@ done < <(echo "$DETECT_OUTPUT" | grep '^GPU:')
 echo -e "  ${CYAN}Total VRAM per GPU: ${VRAM_MIB} MiB (${VRAM_GIB} GiB)${NC}"
 
 # ==============================================================================
-# STEP 3: Docker setup
+# STEP 3: Docker setup (user chooses version)
 # ==============================================================================
 echo -e "\n${CYAN}--- Docker Setup ---${NC}"
 mkdir -p "$MODEL_DIR"
 
-DOCKER_IMAGE="intel/llm-scaler-vllm:${DEFAULT_IMAGE_TAG}"
-
-# If container exists with a different image, remove it
+# Show locally available intel/llm-scaler-vllm images
+LOCAL_TAGS=$(sudo docker images "intel/llm-scaler-vllm" --format '{{.Tag}}' 2>/dev/null | sort -V)
+CURRENT_CONTAINER_IMAGE=""
 if sudo docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-    EXISTING_IMAGE=$(sudo docker inspect --format='{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null || echo "")
-    if [ "$EXISTING_IMAGE" != "$DOCKER_IMAGE" ] && [ -n "$EXISTING_IMAGE" ]; then
-        echo -e "${YELLOW}[!] Container exists with image ${EXISTING_IMAGE}, need ${DOCKER_IMAGE}${NC}"
-        echo -e "${YELLOW}    Removing old container...${NC}"
-        sudo docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1
-    fi
+    CURRENT_CONTAINER_IMAGE=$(sudo docker inspect --format='{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null || echo "")
 fi
 
-if ! sudo docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-    echo -e "${YELLOW}Pulling ${DOCKER_IMAGE}...${NC}"
-    sudo docker pull "$DOCKER_IMAGE"
+echo "----------------------------------------------"
+if [ -n "$LOCAL_TAGS" ]; then
+    echo -e "  ${GREEN}Locally available versions:${NC}"
+    while IFS= read -r tag; do
+        if [ "intel/llm-scaler-vllm:${tag}" = "$CURRENT_CONTAINER_IMAGE" ]; then
+            echo -e "    ${GREEN}* ${tag}  (current container)${NC}"
+        else
+            echo -e "    - ${tag}"
+        fi
+    done <<< "$LOCAL_TAGS"
+else
+    echo -e "  ${YELLOW}No local images found.${NC}"
+fi
+echo "----------------------------------------------"
+echo -e "  Default: ${CYAN}${DEFAULT_IMAGE_TAG}${NC}"
+echo -e "  Releases: https://github.com/intel/llm-scaler/blob/main/Releases.md"
+echo ""
+if [ -n "$CURRENT_CONTAINER_IMAGE" ]; then
+    echo -e "Press ${GREEN}Enter${NC} to keep current (${CURRENT_CONTAINER_IMAGE##*:}), or type a version tag:"
+else
+    echo -e "Press ${GREEN}Enter${NC} for default (${DEFAULT_IMAGE_TAG}), or type a version tag:"
+fi
+read -p "Version: " USER_TAG
+USER_TAG=$(echo "$USER_TAG" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+if [ -z "$USER_TAG" ]; then
+    if [ -n "$CURRENT_CONTAINER_IMAGE" ]; then
+        # Keep using whatever the current container has
+        CHOSEN_TAG="${CURRENT_CONTAINER_IMAGE##*:}"
+    else
+        CHOSEN_TAG="$DEFAULT_IMAGE_TAG"
+    fi
+else
+    CHOSEN_TAG="$USER_TAG"
+fi
+
+DOCKER_IMAGE="intel/llm-scaler-vllm:${CHOSEN_TAG}"
+echo -e "${CYAN}  Selected: ${DOCKER_IMAGE}${NC}"
+
+# Check if chosen image matches current container -- if so, just reuse it
+if [ "$CURRENT_CONTAINER_IMAGE" = "$DOCKER_IMAGE" ]; then
+    echo -e "${GREEN}[OK] Container already running with ${DOCKER_IMAGE}, reusing.${NC}"
+    sudo docker start "$CONTAINER_NAME" >/dev/null 2>&1 || true
+else
+    # Remove old container if it exists (different version)
+    if [ -n "$CURRENT_CONTAINER_IMAGE" ]; then
+        echo -e "${YELLOW}[!] Container has ${CURRENT_CONTAINER_IMAGE}, switching to ${DOCKER_IMAGE}${NC}"
+        sudo docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1
+    fi
+
+    # Pull only if image not available locally
+    if ! sudo docker images --format '{{.Repository}}:{{.Tag}}' | grep -q "^${DOCKER_IMAGE}$"; then
+        echo -e "${YELLOW}Pulling ${DOCKER_IMAGE}...${NC}"
+        sudo docker pull "$DOCKER_IMAGE"
+    else
+        echo -e "${GREEN}[OK] Image ${DOCKER_IMAGE} already downloaded.${NC}"
+    fi
+
     echo -e "${YELLOW}Creating container...${NC}"
     sudo docker run -td \
         --privileged --net=host --device=/dev/dri \
@@ -275,8 +325,6 @@ if ! sudo docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; th
         --shm-size="32g" \
         --entrypoint /bin/bash \
         "$DOCKER_IMAGE"
-else
-    sudo docker start "$CONTAINER_NAME" >/dev/null 2>&1
 fi
 echo -e "${GREEN}[OK] Container ready (${DOCKER_IMAGE}).${NC}"
 
