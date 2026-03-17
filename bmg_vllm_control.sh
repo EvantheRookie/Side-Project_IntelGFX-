@@ -593,38 +593,40 @@ quant_method = qcfg.get('quant_method', '').lower()
 quant_bits = qcfg.get('bits', 0)
 
 # Map known quant methods to vLLM --quantization flag and bytes-per-param
-# If no pre-quantization found, we'll use fp8 (Intel spec default)
+# CRITICAL: vLLM requires --quantization to EXACTLY match config.json's
+# quant_method, so we pass it through directly. We only need to know
+# bytes-per-param for VRAM calculation.
 quant_flag = ''
 quant_display = ''
 bytes_per_param = 1.0  # default fp8
 
 if quant_method in ('gptq', 'gptq_v2'):
-    quant_flag = 'gptq'
+    quant_flag = quant_method
     quant_display = f'GPTQ INT{quant_bits or 4} (pre-quantized)'
     bytes_per_param = (quant_bits or 4) / 8.0
 elif quant_method in ('awq', 'gemm'):
-    quant_flag = 'awq'
+    quant_flag = quant_method
     quant_display = f'AWQ INT{quant_bits or 4} (pre-quantized)'
     bytes_per_param = (quant_bits or 4) / 8.0
 elif quant_method in ('auto-round', 'autoround', 'auto_round', 'intel/auto-round'):
-    # AutoRound uses GPTQ-compatible format
-    quant_flag = 'gptq'
-    quant_display = f'AutoRound INT{quant_bits or 4} (pre-quantized, loaded via GPTQ)'
+    # Pass exact quant_method -- vLLM validates it matches config.json
+    quant_flag = quant_method
+    quant_display = f'AutoRound INT{quant_bits or 4} (pre-quantized)'
     bytes_per_param = (quant_bits or 4) / 8.0
 elif quant_method in ('marlin',):
-    quant_flag = 'marlin'
+    quant_flag = quant_method
     quant_display = f'Marlin INT{quant_bits or 4} (pre-quantized)'
     bytes_per_param = (quant_bits or 4) / 8.0
 elif quant_method in ('squeezellm',):
-    quant_flag = 'squeezellm'
+    quant_flag = quant_method
     quant_display = f'SqueezeLLM (pre-quantized)'
     bytes_per_param = (quant_bits or 4) / 8.0
 elif quant_method in ('fp8', 'fbgemm_fp8'):
-    quant_flag = 'fp8'
+    quant_flag = quant_method
     quant_display = 'FP8 (pre-quantized)'
     bytes_per_param = 1.0
 elif quant_method in ('bitsandbytes', 'bnb'):
-    quant_flag = 'bitsandbytes'
+    quant_flag = quant_method
     quant_display = f'BitsAndBytes {quant_bits or 4}-bit (pre-quantized)'
     bytes_per_param = (quant_bits or 4) / 8.0
 elif quant_method:
