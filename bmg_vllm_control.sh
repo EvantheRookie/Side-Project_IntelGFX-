@@ -242,6 +242,12 @@ while IFS='|' read -r _idx card pci_id root_port speed width hwmon vram_b; do
     fi
 done < <(echo "$DETECT_OUTPUT" | grep '^GPU:')
 echo -e "  ${CYAN}Total VRAM per GPU: ${VRAM_MIB} MiB (${VRAM_GIB} GiB)${NC}"
+if [ "$GPU_COUNT" -gt 1 ]; then
+    TOTAL_VRAM_GIB=$(( VRAM_GIB * GPU_COUNT ))
+    echo -e "  ${CYAN}Total VRAM (${GPU_COUNT} GPUs): ${TOTAL_VRAM_GIB} GiB (tensor parallelism)${NC}"
+else
+    TOTAL_VRAM_GIB=$VRAM_GIB
+fi
 
 # ==============================================================================
 # STEP 3: Docker setup (user chooses version)
@@ -359,14 +365,18 @@ else
     fi
 
     echo -e "${YELLOW}Creating container...${NC}"
+    # --privileged --device=/dev/dri: access ALL Intel GPUs
+    # --ipc=host: required for multi-GPU communication (CCL/oneCCL)
+    # --shm-size: large shared memory for multi-GPU tensor parallelism
     sudo docker run -td \
         --privileged --net=host --device=/dev/dri \
+        --ipc=host \
         --name="$CONTAINER_NAME" \
         -v "${MODEL_DIR}:/llm/models/" \
         -e no_proxy=localhost,127.0.0.1 \
         -e http_proxy="${http_proxy:-}" \
         -e https_proxy="${https_proxy:-}" \
-        --shm-size="32g" \
+        --shm-size="64g" \
         --entrypoint /bin/bash \
         "$DOCKER_IMAGE"
 fi
@@ -704,15 +714,14 @@ HEAD_DIM=${HEAD_DIM:-0}
 MAX_POS_EMBED=${MAX_POS_EMBED:-0}
 
 # ---- Early VRAM check: fail fast if model can't possibly fit ----
-if [ "$(echo "$MODEL_SIZE_GB $VRAM_GIB" | awk '{print ($1 > $2)}')" = "1" ]; then
-    echo -e "${RED}[FAIL] Model weights are ${MODEL_SIZE_GB} GB but GPU only has ${VRAM_GIB} GiB VRAM.${NC}"
+# With tensor parallelism, model weights are split across GPUs
+if [ "$(echo "$MODEL_SIZE_GB $TOTAL_VRAM_GIB" | awk '{print ($1 > $2)}')" = "1" ]; then
+    echo -e "${RED}[FAIL] Model weights are ${MODEL_SIZE_GB} GB but total GPU VRAM is only ${TOTAL_VRAM_GIB} GiB (${GPU_COUNT} GPU(s) x ${VRAM_GIB} GiB).${NC}"
     echo -e "${RED}  This model cannot fit in your GPU memory.${NC}"
     echo -e "${YELLOW}  Options:${NC}"
     echo -e "${YELLOW}    1. Use a smaller/more quantized variant of this model${NC}"
     echo -e "${YELLOW}    2. Use a smaller model (e.g. 7B instead of 70B)${NC}"
-    if [ "$GPU_COUNT" -eq 1 ]; then
-        echo -e "${YELLOW}    3. Add more GPUs and use tensor parallelism${NC}"
-    fi
+    echo -e "${YELLOW}    3. Add more GPUs and use tensor parallelism${NC}"
     exit 1
 fi
 
@@ -720,12 +729,13 @@ fi
 # KV cache per token per layer = 2 * num_kv_heads * head_dim * dtype_bytes (fp16=2)
 # Total KV per token = num_layers * kv_per_token_per_layer
 # Available VRAM for KV = total_vram * gpu_util - model_weights - overhead
-MODEL_LEN=$(awk -v vram="$VRAM_GIB" -v model_gb="$MODEL_SIZE_GB" \
+MODEL_LEN=$(awk -v vram="$TOTAL_VRAM_GIB" -v model_gb="$MODEL_SIZE_GB" \
                 -v num_layers="$NUM_LAYERS" -v num_kv_heads="$NUM_KV_HEADS" \
                 -v head_dim="$HEAD_DIM" -v max_pos="$MAX_POS_EMBED" \
-                -v pre_q="$PRE_QUANTIZED" -v pb="$PARAM_B" '
+                -v pre_q="$PRE_QUANTIZED" -v pb="$PARAM_B" \
+                -v gpu_count="$GPU_COUNT" '
 BEGIN {
-    usable_gb = vram * 0.85  # leave 15% for driver/OS/fragmentation
+    usable_gb = vram * 0.85  # leave 15% for driver/OS/fragmentation per GPU
 
     # Model weight VRAM = file size on disk (what gets loaded)
     # Plus ~20% overhead for activations, optimizer states, buffers
@@ -774,7 +784,12 @@ echo -e "  Model size:  ~${PARAM_B}B params"
 if [ "$(echo "$MODEL_SIZE_GB" | awk '{print ($1 > 0)}')" = "1" ]; then
     echo -e "  Weight files: ${MODEL_SIZE_GB} GB on disk"
 fi
-echo -e "  VRAM:        ${VRAM_GIB} GiB x ${GPU_COUNT} GPU(s)"
+if [ "$GPU_COUNT" -gt 1 ]; then
+    echo -e "  VRAM:        ${VRAM_GIB} GiB x ${GPU_COUNT} GPU(s) = ${TOTAL_VRAM_GIB} GiB total"
+    echo -e "  Tensor parallel: ${GPU_COUNT}-way (model split across ${GPU_COUNT} GPUs)"
+else
+    echo -e "  VRAM:        ${VRAM_GIB} GiB x 1 GPU"
+fi
 echo -e "  Quantization: ${QUANT_DISPLAY}"
 if [ "$NUM_LAYERS" -gt 0 ] && [ "$NUM_KV_HEADS" -gt 0 ]; then
     echo -e "  KV config:   ${NUM_LAYERS} layers, ${NUM_KV_HEADS} KV heads, head_dim=${HEAD_DIM}"
@@ -784,8 +799,8 @@ if [ "$MAX_POS_EMBED" -gt 0 ]; then
 fi
 echo -e "${GREEN}  max-model-len: ${MODEL_LEN}${NC}"
 
-TP_ARG=""
-[ "$GPU_COUNT" -gt 1 ] && TP_ARG="-tp ${GPU_COUNT}"
+# Tensor parallelism: always pass -tp (even for 1 GPU, for explicitness)
+TP_ARG="-tp ${GPU_COUNT}"
 
 # --- Build vLLM flags based on model type and quantization ---
 # Pre-quantized: let vLLM auto-detect from config.json, add --allow-deprecated-quantization
