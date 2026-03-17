@@ -442,8 +442,6 @@ MODEL_CHECK=$(sudo docker exec "$CONTAINER_NAME" python3 -c "
 import json, sys, os
 
 model_dir = '/llm/models/${MODEL_NAME}'
-result = 'OK'
-detail = ''
 
 try:
     cfg = json.load(open(os.path.join(model_dir, 'config.json')))
@@ -459,50 +457,49 @@ try:
                 sys.exit(0)
 
     # --- Check quantization method compatibility ---
-    # If model is pre-quantized, verify this vLLM version supports that method
     qcfg = cfg.get('quantization_config', {})
     quant_method = qcfg.get('quant_method', '').lower()
     if quant_method:
         try:
             from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS
-            # QUANTIZATION_METHODS is a dict of supported method names
             if quant_method not in QUANTIZATION_METHODS:
                 print(f'UNSUPPORTED_QUANT:{quant_method}')
                 sys.exit(0)
         except ImportError:
-            pass  # Older vLLM without this registry, skip check
+            pass
 
-    # --- Check model type: reject non-generation models ---
-    # Rerankers, embeddings, classifiers cannot do text generation
+    # --- Detect model type (all types supported by Intel llm-scaler) ---
     model_type = cfg.get('model_type', '').lower()
     arch_str = ' '.join(archs).lower()
-
-    # Reject non-generation models (rerankers, embeddings, classifiers)
-    # Check both the architecture class names AND the model folder name
     model_name_lower = os.path.basename(model_dir).lower()
-    reject_keywords = ['reranker', 'classifier', 'embedding', 'reward']
-    for kw in reject_keywords:
-        if kw in arch_str or kw in model_type or kw in model_name_lower:
-            print(f'BAD_TYPE:This is a {kw} model, not a text generation model')
-            sys.exit(0)
 
-    # Reject sequence classification models
-    for a in archs:
-        if 'ForSequenceClassification' in a or 'ForTokenClassification' in a:
-            print(f'BAD_TYPE:{a} is a classification model, not for text generation')
-            sys.exit(0)
+    # Detect task type for vLLM --task flag
+    # Order matters: check specific types first
+    is_embedding = any(kw in s for kw in ['embedding'] for s in [arch_str, model_type, model_name_lower])
+    is_reranker = any(kw in s for kw in ['reranker', 'rerank'] for s in [arch_str, model_type, model_name_lower])
+    is_classifier = any('ForSequenceClassification' in a or 'ForTokenClassification' in a for a in archs)
+    is_reward = any(kw in s for kw in ['reward'] for s in [arch_str, model_type, model_name_lower])
+    is_mm = any(kw in s for kw in ['vl', 'vision', 'visual', 'image', 'video']
+                for s in [arch_str, model_type])
 
-    # --- Deep check: try to actually load the config through transformers ---
-    # This catches attribute errors like 'tie_word_embeddings' missing
-    # Runs for ALL models including vision/multimodal (which llm-scaler supports)
+    if is_reranker or is_classifier:
+        print('OK_SCORE')
+    elif is_embedding:
+        print('OK_EMBED')
+    elif is_reward:
+        print('OK_REWARD')
+    elif is_mm:
+        print('OK_MULTIMODAL')
+    else:
+        print('OK_GENERATE')
+
+    # --- Deep check: try loading config through transformers ---
     try:
         from transformers import AutoConfig
         auto_cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
-        # Probe attributes that vLLM accesses during model init
         _ = getattr(auto_cfg, 'tie_word_embeddings', None)
         _ = getattr(auto_cfg, 'hidden_size', None)
         _ = getattr(auto_cfg, 'num_attention_heads', None)
-        # For VL models, also probe the text config if present
         text_cfg = getattr(auto_cfg, 'text_config', None)
         if text_cfg is not None:
             _ = getattr(text_cfg, 'tie_word_embeddings', None)
@@ -511,19 +508,9 @@ try:
         print(f'CONFIG_ERROR:{e}')
         sys.exit(0)
     except Exception as e:
-        err_str = str(e)
-        if 'attribute' in err_str.lower():
-            print(f'CONFIG_ERROR:{err_str}')
+        if 'attribute' in str(e).lower():
+            print(f'CONFIG_ERROR:{e}')
             sys.exit(0)
-        # Other errors (missing tokenizer etc) are less critical, continue
-
-    # Note if multimodal (for display only, not a blocker)
-    is_mm = any(kw.lower() in arch_str or kw.lower() in model_type
-                for kw in ['vl', 'vision', 'visual', 'image', 'video'])
-    if is_mm:
-        print('OK_MULTIMODAL')
-    else:
-        print('OK')
 
 except FileNotFoundError:
     print('NO_CONFIG:config.json not found')
@@ -531,7 +518,8 @@ except Exception as e:
     print(f'WARN:{e}')
 " 2>/dev/null || echo "SKIP")
 
-# Handle all result types
+# Determine model task type and vLLM --task flag
+MODEL_TASK="generate"  # default
 case "$MODEL_CHECK" in
     UNSUPPORTED_ARCH:*)
         BAD_ARCH="${MODEL_CHECK#UNSUPPORTED_ARCH:}"
@@ -542,23 +530,10 @@ case "$MODEL_CHECK" in
     UNSUPPORTED_QUANT:*)
         BAD_QUANT="${MODEL_CHECK#UNSUPPORTED_QUANT:}"
         echo -e "${RED}[FAIL] Quantization method '${BAD_QUANT}' not supported by this vLLM container.${NC}"
-        echo -e "${YELLOW}  This model is pre-quantized with '${BAD_QUANT}', but the current container${NC}"
-        echo -e "${YELLOW}  (vLLM version) doesn't support it.${NC}"
         echo -e "${YELLOW}  Options:${NC}"
-        echo -e "${YELLOW}    1. Upgrade: choose a newer container version (1.0+)${NC}"
+        echo -e "${YELLOW}    1. Upgrade: choose a newer container version${NC}"
         echo -e "${YELLOW}    2. Use a non-quantized or FP8 version of this model${NC}"
         exit 1
-        ;;
-    BAD_TYPE:*)
-        REASON="${MODEL_CHECK#BAD_TYPE:}"
-        echo -e "${RED}[FAIL] ${REASON}${NC}"
-        echo -e "${YELLOW}  The vLLM benchmark requires a text generation (CausalLM) model.${NC}"
-        echo -e "${YELLOW}  Examples: DeepSeek-R1-Distill-Qwen-7B, Qwen2.5-7B-Instruct, Llama-3.1-8B${NC}"
-        exit 1
-        ;;
-    OK_MULTIMODAL)
-        echo -e "${GREEN}[OK] Model compatible (vision/multimodal).${NC}"
-        echo -e "${YELLOW}  Note: The random-text benchmark tests text generation only, not vision.${NC}"
         ;;
     CONFIG_ERROR:*)
         CFG_ERR="${MODEL_CHECK#CONFIG_ERROR:}"
@@ -571,7 +546,24 @@ case "$MODEL_CHECK" in
         echo -e "${RED}[FAIL] No config.json in model directory.${NC}"
         exit 1
         ;;
-    OK)
+    OK_EMBED*)
+        MODEL_TASK="embed"
+        echo -e "${GREEN}[OK] Model compatible (embedding).${NC}"
+        ;;
+    OK_SCORE*)
+        MODEL_TASK="score"
+        echo -e "${GREEN}[OK] Model compatible (reranker/scoring).${NC}"
+        ;;
+    OK_REWARD*)
+        MODEL_TASK="reward"
+        echo -e "${GREEN}[OK] Model compatible (reward).${NC}"
+        ;;
+    OK_MULTIMODAL*)
+        MODEL_TASK="generate"
+        echo -e "${GREEN}[OK] Model compatible (vision/multimodal).${NC}"
+        ;;
+    OK_GENERATE*)
+        MODEL_TASK="generate"
         echo -e "${GREEN}[OK] Model compatible (text generation).${NC}"
         ;;
     SKIP|WARN:*)
@@ -581,6 +573,7 @@ case "$MODEL_CHECK" in
         echo -e "${YELLOW}[WARN] Unexpected check result: ${MODEL_CHECK}${NC}"
         ;;
 esac
+echo -e "  Task type: ${MODEL_TASK}"
 
 # ==============================================================================
 # STEP 6: Auto-profile model from config.json (no guessing)
@@ -794,15 +787,24 @@ echo -e "${GREEN}  max-model-len: ${MODEL_LEN}${NC}"
 TP_ARG=""
 [ "$GPU_COUNT" -gt 1 ] && TP_ARG="-tp ${GPU_COUNT}"
 
-# For pre-quantized models: let vLLM auto-detect from config.json (no --quantization flag)
-#   BUT pass --allow-deprecated-quantization because vLLM still reads quantization_config
-#   from config.json and will reject deprecated methods (e.g. auto-round) without it.
-# For non-quantized models: apply FP8 online quantization (Intel spec default)
+# --- Build vLLM flags based on model type and quantization ---
+# Pre-quantized: let vLLM auto-detect from config.json, add --allow-deprecated-quantization
+# Non-quantized: apply FP8 online quantization (Intel spec default)
 QUANT_ARGS=""
 if [ "$PRE_QUANTIZED" -eq 1 ]; then
     QUANT_ARGS="--allow-deprecated-quantization"
 else
     QUANT_ARGS="--quantization fp8"
+fi
+
+# Task flag per model type (Intel llm-scaler supports all these)
+TASK_ARGS=""
+if [ "$MODEL_TASK" = "embed" ]; then
+    TASK_ARGS="--task embed"
+elif [ "$MODEL_TASK" = "score" ]; then
+    TASK_ARGS="--task score"
+elif [ "$MODEL_TASK" = "reward" ]; then
+    TASK_ARGS="--task reward"
 fi
 
 # ==============================================================================
@@ -816,7 +818,7 @@ start_vllm_server() {
     sleep 2
     sudo docker exec "$CONTAINER_NAME" bash -c "> /tmp/vllm_server.log"
 
-    echo -e "${YELLOW}Starting vLLM server (port ${VLLM_PORT}, max-model-len=${cur_model_len})...${NC}"
+    echo -e "${YELLOW}Starting vLLM server (port ${VLLM_PORT}, task=${MODEL_TASK}, max-model-len=${cur_model_len})...${NC}"
     sudo docker exec -d "$CONTAINER_NAME" bash -c "
         source /opt/intel/oneapi/setvars.sh --force 2>/dev/null || true
         VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
@@ -834,6 +836,7 @@ start_vllm_server() {
             --disable-log-requests \
             --max-model-len=${cur_model_len} \
             --block-size 64 \
+            ${TASK_ARGS} \
             ${QUANT_ARGS} \
             ${TP_ARG} \
         > /tmp/vllm_server.log 2>&1
@@ -916,47 +919,163 @@ fi
 # ==============================================================================
 echo -e "\n${CYAN}--- Running Benchmark ---${NC}"
 
-# Intel spec benchmark defaults
-IN_LEN=1024
-OUT_LEN=512
-NUM_PROMPTS=10
+if [ "$MODEL_TASK" = "generate" ]; then
+    # ---------- Text generation benchmark ----------
+    IN_LEN=1024
+    OUT_LEN=512
+    NUM_PROMPTS=10
 
-# Clamp if needed
-MAX_BENCH=$(( MODEL_LEN - 256 ))
-if [ $(( IN_LEN + OUT_LEN )) -gt "$MAX_BENCH" ]; then
-    IN_LEN=$(( MAX_BENCH * 2 / 3 ))
-    OUT_LEN=$(( MAX_BENCH - IN_LEN ))
-    # Round to 128
-    IN_LEN=$(( (IN_LEN / 128) * 128 ))
-    OUT_LEN=$(( (OUT_LEN / 128) * 128 ))
-    [ "$IN_LEN" -lt 128 ] && IN_LEN=128
-    [ "$OUT_LEN" -lt 128 ] && OUT_LEN=128
-    echo -e "${YELLOW}  Adjusted for context: input=${IN_LEN}, output=${OUT_LEN}${NC}"
-fi
+    # Clamp if needed
+    MAX_BENCH=$(( MODEL_LEN - 256 ))
+    if [ $(( IN_LEN + OUT_LEN )) -gt "$MAX_BENCH" ]; then
+        IN_LEN=$(( MAX_BENCH * 2 / 3 ))
+        OUT_LEN=$(( MAX_BENCH - IN_LEN ))
+        IN_LEN=$(( (IN_LEN / 128) * 128 ))
+        OUT_LEN=$(( (OUT_LEN / 128) * 128 ))
+        [ "$IN_LEN" -lt 128 ] && IN_LEN=128
+        [ "$OUT_LEN" -lt 128 ] && OUT_LEN=128
+        echo -e "${YELLOW}  Adjusted for context: input=${IN_LEN}, output=${OUT_LEN}${NC}"
+    fi
 
-echo -e "  input-len:    ${IN_LEN}"
-echo -e "  output-len:   ${OUT_LEN}"
-echo -e "  num-prompts:  ${NUM_PROMPTS}"
-echo -e "  request-rate: inf"
-echo ""
+    echo -e "  Task:         text generation"
+    echo -e "  input-len:    ${IN_LEN}"
+    echo -e "  output-len:   ${OUT_LEN}"
+    echo -e "  num-prompts:  ${NUM_PROMPTS}"
+    echo -e "  request-rate: inf"
+    echo ""
 
-# Exact benchmark command from Intel llm-scaler README:
-# https://github.com/intel/llm-scaler/blob/main/vllm/README.md
-sudo docker exec -it "$CONTAINER_NAME" bash -c "
-    source /opt/intel/oneapi/setvars.sh --force 2>/dev/null || true
-    vllm bench serve \
-        --model /llm/models/${MODEL_NAME} \
-        --dataset-name random \
-        --served-model-name ${MODEL_NAME} \
-        --random-input-len=${IN_LEN} \
-        --random-output-len=${OUT_LEN} \
-        --ignore-eos \
-        --num-prompt ${NUM_PROMPTS} \
-        --trust_remote_code \
-        --request-rate inf \
-        --backend vllm \
-        --port=${VLLM_PORT}
+    sudo docker exec -it "$CONTAINER_NAME" bash -c "
+        source /opt/intel/oneapi/setvars.sh --force 2>/dev/null || true
+        vllm bench serve \
+            --model /llm/models/${MODEL_NAME} \
+            --dataset-name random \
+            --served-model-name ${MODEL_NAME} \
+            --random-input-len=${IN_LEN} \
+            --random-output-len=${OUT_LEN} \
+            --ignore-eos \
+            --num-prompt ${NUM_PROMPTS} \
+            --trust_remote_code \
+            --request-rate inf \
+            --backend vllm \
+            --port=${VLLM_PORT}
+    "
+
+elif [ "$MODEL_TASK" = "embed" ]; then
+    # ---------- Embedding benchmark ----------
+    NUM_PROMPTS=100
+    IN_LEN=256
+
+    echo -e "  Task:         embedding"
+    echo -e "  input-len:    ${IN_LEN}"
+    echo -e "  num-prompts:  ${NUM_PROMPTS}"
+    echo -e "  Endpoint:     /v1/embeddings"
+    echo ""
+
+    # Use curl-based benchmark for embeddings: send random text to /v1/embeddings
+    sudo docker exec -it "$CONTAINER_NAME" python3 -c "
+import time, requests, random, string, json
+
+url = 'http://localhost:${VLLM_PORT}/v1/embeddings'
+model = '${MODEL_NAME}'
+num_prompts = ${NUM_PROMPTS}
+input_len = ${IN_LEN}
+
+# Generate random prompts
+prompts = []
+for _ in range(num_prompts):
+    text = ' '.join(''.join(random.choices(string.ascii_lowercase, k=5)) for _ in range(input_len // 6))
+    prompts.append(text)
+
+print(f'Sending {num_prompts} embedding requests...')
+latencies = []
+errors = 0
+for i, text in enumerate(prompts):
+    t0 = time.time()
+    try:
+        r = requests.post(url, json={'model': model, 'input': text}, timeout=60)
+        r.raise_for_status()
+        latencies.append(time.time() - t0)
+    except Exception as e:
+        errors += 1
+        if errors <= 3:
+            print(f'  Error on request {i+1}: {e}')
+    if (i+1) % 20 == 0:
+        print(f'  {i+1}/{num_prompts} done...')
+
+if latencies:
+    latencies.sort()
+    avg = sum(latencies) / len(latencies)
+    p50 = latencies[len(latencies)//2]
+    p99 = latencies[int(len(latencies)*0.99)]
+    throughput = len(latencies) / sum(latencies)
+    print()
+    print(f'=== Embedding Benchmark Results ===')
+    print(f'  Successful:   {len(latencies)}/{num_prompts}')
+    print(f'  Throughput:   {throughput:.2f} req/s')
+    print(f'  Avg latency:  {avg*1000:.1f} ms')
+    print(f'  P50 latency:  {p50*1000:.1f} ms')
+    print(f'  P99 latency:  {p99*1000:.1f} ms')
+else:
+    print('No successful requests.')
 "
+
+elif [ "$MODEL_TASK" = "score" ]; then
+    # ---------- Reranker/Score benchmark ----------
+    NUM_PROMPTS=50
+
+    echo -e "  Task:         reranker (scoring)"
+    echo -e "  num-prompts:  ${NUM_PROMPTS}"
+    echo -e "  Endpoint:     /v1/score"
+    echo ""
+
+    sudo docker exec -it "$CONTAINER_NAME" python3 -c "
+import time, requests, random, string, json
+
+url = 'http://localhost:${VLLM_PORT}/v1/score'
+model = '${MODEL_NAME}'
+num_prompts = ${NUM_PROMPTS}
+
+print(f'Sending {num_prompts} scoring requests...')
+latencies = []
+errors = 0
+for i in range(num_prompts):
+    query = ' '.join(''.join(random.choices(string.ascii_lowercase, k=5)) for _ in range(20))
+    doc = ' '.join(''.join(random.choices(string.ascii_lowercase, k=5)) for _ in range(50))
+    t0 = time.time()
+    try:
+        r = requests.post(url, json={'model': model, 'text_1': query, 'text_2': doc}, timeout=60)
+        r.raise_for_status()
+        latencies.append(time.time() - t0)
+    except Exception as e:
+        errors += 1
+        if errors <= 3:
+            print(f'  Error on request {i+1}: {e}')
+    if (i+1) % 10 == 0:
+        print(f'  {i+1}/{num_prompts} done...')
+
+if latencies:
+    latencies.sort()
+    avg = sum(latencies) / len(latencies)
+    p50 = latencies[len(latencies)//2]
+    p99 = latencies[int(len(latencies)*0.99)]
+    throughput = len(latencies) / sum(latencies)
+    print()
+    print(f'=== Reranker Benchmark Results ===')
+    print(f'  Successful:   {len(latencies)}/{num_prompts}')
+    print(f'  Throughput:   {throughput:.2f} req/s')
+    print(f'  Avg latency:  {avg*1000:.1f} ms')
+    print(f'  P50 latency:  {p50*1000:.1f} ms')
+    print(f'  P99 latency:  {p99*1000:.1f} ms')
+else:
+    print('No successful requests.')
+"
+
+else
+    # ---------- Other model types (reward, etc.) ----------
+    echo -e "${YELLOW}  No standard benchmark for task type '${MODEL_TASK}'.${NC}"
+    echo -e "${GREEN}  Server is running on port ${VLLM_PORT} — you can test manually.${NC}"
+    echo -e "  Example: curl http://localhost:${VLLM_PORT}/v1/models"
+fi
 
 echo -e "\n${GREEN}=====================================================${NC}"
 echo -e "${GREEN}  Benchmark complete.                                ${NC}"
