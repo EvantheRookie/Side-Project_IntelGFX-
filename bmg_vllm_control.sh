@@ -559,55 +559,113 @@ case "$MODEL_CHECK" in
 esac
 
 # ==============================================================================
-# STEP 6: Calculate max-model-len
+# STEP 6: Auto-profile model (params, quantization, max-model-len)
 # ==============================================================================
 echo -e "\n${CYAN}--- Model Profiling ---${NC}"
 
-# Extract param count: try config.json first, then model name, then default 7
+# Read param count AND quantization from config.json in one pass
+eval "$(sudo docker exec "$CONTAINER_NAME" python3 -c "
+import json, sys, os
+
+model_dir = '/llm/models/${MODEL_NAME}'
+cfg = json.load(open(os.path.join(model_dir, 'config.json')))
+
+# --- Param count ---
+h = cfg.get('hidden_size', 0)
+n = cfg.get('num_hidden_layers', 0)
+v = cfg.get('vocab_size', 0)
+i = cfg.get('intermediate_size', h * 4)
+param_b = ''
+if h > 0 and n > 0:
+    params = v * h + n * (4 * h * h + 3 * h * i)
+    billions = params / 1e9
+    for s in [0.5, 1, 1.5, 2, 3, 4, 7, 8, 9, 13, 14, 15, 32, 34, 70, 72]:
+        if abs(billions - s) / max(s, 1) < 0.3:
+            param_b = str(s); break
+    if not param_b:
+        param_b = f'{billions:.1f}'
+print(f'CFG_PARAM_B={param_b}')
+
+# --- Quantization detection ---
+# Check quantization_config in config.json
+qcfg = cfg.get('quantization_config', {})
+quant_method = qcfg.get('quant_method', '').lower()
+quant_bits = qcfg.get('bits', 0)
+
+# Map known quant methods to vLLM --quantization flag and bytes-per-param
+# If no pre-quantization found, we'll use fp8 (Intel spec default)
+quant_flag = ''
+quant_display = ''
+bytes_per_param = 1.0  # default fp8
+
+if quant_method in ('gptq', 'gptq_v2'):
+    quant_flag = 'gptq'
+    quant_display = f'GPTQ INT{quant_bits or 4} (pre-quantized)'
+    bytes_per_param = (quant_bits or 4) / 8.0
+elif quant_method in ('awq', 'gemm'):
+    quant_flag = 'awq'
+    quant_display = f'AWQ INT{quant_bits or 4} (pre-quantized)'
+    bytes_per_param = (quant_bits or 4) / 8.0
+elif quant_method in ('auto-round', 'autoround', 'auto_round', 'intel/auto-round'):
+    # AutoRound uses GPTQ-compatible format
+    quant_flag = 'gptq'
+    quant_display = f'AutoRound INT{quant_bits or 4} (pre-quantized, loaded via GPTQ)'
+    bytes_per_param = (quant_bits or 4) / 8.0
+elif quant_method in ('marlin',):
+    quant_flag = 'marlin'
+    quant_display = f'Marlin INT{quant_bits or 4} (pre-quantized)'
+    bytes_per_param = (quant_bits or 4) / 8.0
+elif quant_method in ('squeezellm',):
+    quant_flag = 'squeezellm'
+    quant_display = f'SqueezeLLM (pre-quantized)'
+    bytes_per_param = (quant_bits or 4) / 8.0
+elif quant_method in ('fp8', 'fbgemm_fp8'):
+    quant_flag = 'fp8'
+    quant_display = 'FP8 (pre-quantized)'
+    bytes_per_param = 1.0
+elif quant_method in ('bitsandbytes', 'bnb'):
+    quant_flag = 'bitsandbytes'
+    quant_display = f'BitsAndBytes {quant_bits or 4}-bit (pre-quantized)'
+    bytes_per_param = (quant_bits or 4) / 8.0
+elif quant_method:
+    # Unknown quant method - try passing it through, vLLM may support it
+    quant_flag = quant_method
+    quant_display = f'{quant_method} (pre-quantized)'
+    bytes_per_param = (quant_bits or 4) / 8.0 if quant_bits else 1.0
+else:
+    # No pre-quantization: use FP8 online (Intel spec default)
+    quant_flag = 'fp8'
+    quant_display = 'FP8 (online, per Intel spec)'
+    bytes_per_param = 1.0
+
+print(f'QUANT_FLAG={quant_flag}')
+print(f'QUANT_DISPLAY=\"{quant_display}\"')
+print(f'BYTES_PER_PARAM={bytes_per_param}')
+" 2>/dev/null || echo "CFG_PARAM_B=
+QUANT_FLAG=fp8
+QUANT_DISPLAY=\"FP8 (online, per Intel spec)\"
+BYTES_PER_PARAM=1.0")"
+
+# Param count: config.json -> model name -> default 7
 PARAM_B=""
-# Method 1: Read from config.json (most accurate - uses hidden_size, num_layers, vocab)
-CONFIG_PARAM_B=$(sudo docker exec "$CONTAINER_NAME" python3 -c "
-import json, sys
-try:
-    cfg = json.load(open('/llm/models/${MODEL_NAME}/config.json'))
-    h = cfg.get('hidden_size', 0)
-    n = cfg.get('num_hidden_layers', 0)
-    v = cfg.get('vocab_size', 0)
-    i = cfg.get('intermediate_size', h * 4)
-    if h > 0 and n > 0:
-        # Rough param estimate: embedding + n*(attn + ffn)
-        params = v * h + n * (4 * h * h + 3 * h * i)
-        billions = params / 1e9
-        # Round to nearest common size
-        for s in [0.5, 1, 1.5, 2, 3, 4, 7, 8, 9, 13, 14, 15, 32, 34, 70, 72]:
-            if abs(billions - s) / max(s, 1) < 0.3:
-                print(f'{s}'); sys.exit(0)
-        print(f'{billions:.1f}')
-    else:
-        print('')
-except:
-    print('')
-" 2>/dev/null || true)
-
-if [ -n "$CONFIG_PARAM_B" ]; then
-    PARAM_B="$CONFIG_PARAM_B"
+if [ -n "$CFG_PARAM_B" ]; then
+    PARAM_B="$CFG_PARAM_B"
 fi
-
-# Method 2: Parse from model name (e.g. "7B" -> 7)
 if [ -z "$PARAM_B" ]; then
     PARAM_B=$(echo "$MODEL_NAME" | grep -ioE '[0-9]+(\.[0-9]+)?[bB]' \
               | grep -ioE '[0-9]+(\.[0-9]+)?' | tail -1 || true)
 fi
 PARAM_B=${PARAM_B:-7}
+QUANT_FLAG=${QUANT_FLAG:-fp8}
+BYTES_PER_PARAM=${BYTES_PER_PARAM:-1.0}
 
-# With fp8 quantization: 1 byte per param
-# Model memory = params_B * 1 (fp8) * 1.05 (overhead) ~= params_B * 1.05 GB
-# KV cache per token ~= params_B * 0.10 MB (fp8 KV is smaller)
-# Available = VRAM * 0.9 - model_mem
-MODEL_LEN=$(awk -v vram="$VRAM_GIB" -v pb="$PARAM_B" '
+# Calculate max-model-len based on actual quantization
+# Model memory = params_B * bytes_per_param * 1.05 (overhead)
+# KV cache per token ~= params_B * 0.10 MB
+MODEL_LEN=$(awk -v vram="$VRAM_GIB" -v pb="$PARAM_B" -v bpp="$BYTES_PER_PARAM" '
 BEGIN {
     usable = vram * 0.9
-    model_gb = pb * 1.05
+    model_gb = pb * bpp * 1.05
     kv_avail = usable - model_gb
     if (kv_avail < 0.5) kv_avail = 0.5
     raw = (kv_avail * 1024) / (pb * 0.10)
@@ -619,7 +677,8 @@ BEGIN {
 
 echo -e "  Model size:  ~${PARAM_B}B params"
 echo -e "  VRAM:        ${VRAM_GIB} GiB x ${GPU_COUNT} GPU(s)"
-echo -e "  Quantization: FP8 (online, per Intel spec)"
+echo -e "  Quantization: ${QUANT_DISPLAY}"
+echo -e "  Bytes/param: ${BYTES_PER_PARAM}"
 echo -e "${GREEN}  max-model-len: ${MODEL_LEN}${NC}"
 
 TP_ARG=""
@@ -655,7 +714,7 @@ sudo docker exec -d "$CONTAINER_NAME" bash -c "
         --disable-log-requests \
         --max-model-len=${MODEL_LEN} \
         --block-size 64 \
-        --quantization fp8 \
+        --quantization ${QUANT_FLAG} \
         ${TP_ARG} \
     > /tmp/vllm_server.log 2>&1
 "

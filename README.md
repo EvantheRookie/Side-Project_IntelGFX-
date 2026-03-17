@@ -114,13 +114,22 @@ If any check fails, the script exits with a clear error message and suggests com
 
 ### Step 6: Auto-Profiling & max-model-len
 
+**Quantization auto-detection:** Reads `quantization_config.quant_method` from `config.json` to detect pre-quantized models (GPTQ, AWQ, AutoRound, FP8, BitsAndBytes, etc.). Falls back to FP8 online quantization (Intel spec default) for unquantized models.
+
+| Quant method | vLLM flag | Bytes/param |
+|---|---|---|
+| None (unquantized) | `fp8` | 1.0 |
+| GPTQ / AutoRound INT4 | `gptq` | 0.5 |
+| AWQ INT4 | `awq` | 0.5 |
+| FP8 (pre-quantized) | `fp8` | 1.0 |
+
 Calculates optimal `max-model-len` based on:
 - Model parameter count (read from `config.json`, falls back to model name parsing)
-- FP8 quantization (1 byte per parameter)
+- Actual quantization bytes-per-param (not hardcoded)
 - Available VRAM (90% utilization)
 
 ```
-model_mem   = params_B * 1.05 GB (FP8 + overhead)
+model_mem   = params_B * bytes_per_param * 1.05 GB (+ overhead)
 kv_per_tok  = params_B * 0.10 MB
 available   = VRAM * 0.9 - model_mem
 max_len     = available / kv_per_tok
