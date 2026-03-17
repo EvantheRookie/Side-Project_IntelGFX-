@@ -458,6 +458,20 @@ try:
                 print(f'UNSUPPORTED_ARCH:{a}')
                 sys.exit(0)
 
+    # --- Check quantization method compatibility ---
+    # If model is pre-quantized, verify this vLLM version supports that method
+    qcfg = cfg.get('quantization_config', {})
+    quant_method = qcfg.get('quant_method', '').lower()
+    if quant_method:
+        try:
+            from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS
+            # QUANTIZATION_METHODS is a dict of supported method names
+            if quant_method not in QUANTIZATION_METHODS:
+                print(f'UNSUPPORTED_QUANT:{quant_method}')
+                sys.exit(0)
+        except ImportError:
+            pass  # Older vLLM without this registry, skip check
+
     # --- Check model type: reject non-generation models ---
     # Rerankers, embeddings, classifiers cannot do text generation
     model_type = cfg.get('model_type', '').lower()
@@ -523,6 +537,16 @@ case "$MODEL_CHECK" in
         BAD_ARCH="${MODEL_CHECK#UNSUPPORTED_ARCH:}"
         echo -e "${RED}[FAIL] Architecture '${BAD_ARCH}' not supported by this vLLM container.${NC}"
         echo -e "${YELLOW}  Use a supported model or upgrade the container.${NC}"
+        exit 1
+        ;;
+    UNSUPPORTED_QUANT:*)
+        BAD_QUANT="${MODEL_CHECK#UNSUPPORTED_QUANT:}"
+        echo -e "${RED}[FAIL] Quantization method '${BAD_QUANT}' not supported by this vLLM container.${NC}"
+        echo -e "${YELLOW}  This model is pre-quantized with '${BAD_QUANT}', but the current container${NC}"
+        echo -e "${YELLOW}  (vLLM version) doesn't support it.${NC}"
+        echo -e "${YELLOW}  Options:${NC}"
+        echo -e "${YELLOW}    1. Upgrade: choose a newer container version (1.0+)${NC}"
+        echo -e "${YELLOW}    2. Use a non-quantized or FP8 version of this model${NC}"
         exit 1
         ;;
     BAD_TYPE:*)
