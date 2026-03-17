@@ -797,14 +797,28 @@ else
     QUANT_ARGS="--quantization fp8"
 fi
 
-# Task flag per model type (Intel llm-scaler supports all these)
+# Task/runner flag: detect what this vLLM version supports
+# - vLLM <= 0.8: --task embed / --task score
+# - vLLM 0.10-0.13: --task (deprecated but works)
+# - vLLM 0.14+: --task removed, auto-detects model type; use --runner pooling if needed
 TASK_ARGS=""
-if [ "$MODEL_TASK" = "embed" ]; then
-    TASK_ARGS="--task embed"
-elif [ "$MODEL_TASK" = "score" ]; then
-    TASK_ARGS="--task score"
-elif [ "$MODEL_TASK" = "reward" ]; then
-    TASK_ARGS="--task reward"
+if [ "$MODEL_TASK" != "generate" ]; then
+    # Check if this vLLM supports --task or --runner
+    VLLM_HELP=$(sudo docker exec "$CONTAINER_NAME" vllm serve --help 2>&1 || true)
+    if echo "$VLLM_HELP" | grep -q '\-\-task'; then
+        # Old vLLM with --task support
+        if [ "$MODEL_TASK" = "embed" ]; then
+            TASK_ARGS="--task embed"
+        elif [ "$MODEL_TASK" = "score" ]; then
+            TASK_ARGS="--task score"
+        elif [ "$MODEL_TASK" = "reward" ]; then
+            TASK_ARGS="--task reward"
+        fi
+    elif echo "$VLLM_HELP" | grep -q '\-\-runner'; then
+        # vLLM 0.14+ with --runner
+        TASK_ARGS="--runner pooling"
+    fi
+    # If neither flag found, omit — vLLM auto-detects
 fi
 
 # ==============================================================================
