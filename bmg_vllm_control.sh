@@ -611,68 +611,41 @@ if h > 0 and n > 0:
 print(f'CFG_PARAM_B={param_b}')
 
 # --- Quantization detection ---
-# Check quantization_config in config.json
+# For pre-quantized models, vLLM auto-detects the method from config.json.
+# We do NOT pass --quantization for pre-quantized models to avoid:
+#   - deprecated method errors (e.g. auto-round in vLLM 0.14+)
+#   - name mismatches between config.json and vLLM's expected flag names
+# We only need bytes_per_param for VRAM/max-model-len calculation.
 qcfg = cfg.get('quantization_config', {})
 quant_method = qcfg.get('quant_method', '').lower()
 quant_bits = qcfg.get('bits', 0)
 
-# Map known quant methods to vLLM --quantization flag and bytes-per-param
-# CRITICAL: vLLM requires --quantization to EXACTLY match config.json's
-# quant_method, so we pass it through directly. We only need to know
-# bytes-per-param for VRAM calculation.
-quant_flag = ''
 quant_display = ''
-bytes_per_param = 1.0  # default fp8
+bytes_per_param = 2.0  # default fp16
+pre_quantized = 0
 
-if quant_method in ('gptq', 'gptq_v2'):
-    quant_flag = quant_method
-    quant_display = f'GPTQ INT{quant_bits or 4} (pre-quantized)'
-    bytes_per_param = (quant_bits or 4) / 8.0
-elif quant_method in ('awq', 'gemm'):
-    quant_flag = quant_method
-    quant_display = f'AWQ INT{quant_bits or 4} (pre-quantized)'
-    bytes_per_param = (quant_bits or 4) / 8.0
-elif quant_method in ('auto-round', 'autoround', 'auto_round', 'intel/auto-round'):
-    # Pass exact quant_method -- vLLM validates it matches config.json
-    quant_flag = quant_method
-    quant_display = f'AutoRound INT{quant_bits or 4} (pre-quantized)'
-    bytes_per_param = (quant_bits or 4) / 8.0
-elif quant_method in ('marlin',):
-    quant_flag = quant_method
-    quant_display = f'Marlin INT{quant_bits or 4} (pre-quantized)'
-    bytes_per_param = (quant_bits or 4) / 8.0
-elif quant_method in ('squeezellm',):
-    quant_flag = quant_method
-    quant_display = f'SqueezeLLM (pre-quantized)'
-    bytes_per_param = (quant_bits or 4) / 8.0
-elif quant_method in ('fp8', 'fbgemm_fp8'):
-    quant_flag = quant_method
-    quant_display = 'FP8 (pre-quantized)'
-    bytes_per_param = 1.0
-elif quant_method in ('bitsandbytes', 'bnb'):
-    quant_flag = quant_method
-    quant_display = f'BitsAndBytes {quant_bits or 4}-bit (pre-quantized)'
-    bytes_per_param = (quant_bits or 4) / 8.0
-elif quant_method:
-    # Unknown quant method - try passing it through, vLLM may support it
-    quant_flag = quant_method
-    quant_display = f'{quant_method} (pre-quantized)'
-    bytes_per_param = (quant_bits or 4) / 8.0 if quant_bits else 1.0
+if quant_method:
+    pre_quantized = 1
+    bits = quant_bits or 4
+    # Estimate bytes-per-param for VRAM calculation
+    if quant_method in ('fp8', 'fbgemm_fp8'):
+        bytes_per_param = 1.0
+        quant_display = f'FP8 (pre-quantized, auto-detected)'
+    else:
+        bytes_per_param = bits / 8.0
+        quant_display = f'{quant_method} INT{bits} (pre-quantized, auto-detected)'
 else:
     # No pre-quantization: use FP8 online (Intel spec default)
-    quant_flag = 'fp8'
-    quant_display = 'FP8 (online, per Intel spec)'
     bytes_per_param = 1.0
+    quant_display = 'FP8 (online, per Intel spec)'
 
-pre_quantized = 1 if quant_method else 0
-print(f'QUANT_FLAG={quant_flag}')
 print(f'QUANT_DISPLAY=\"{quant_display}\"')
 print(f'BYTES_PER_PARAM={bytes_per_param}')
 print(f'PRE_QUANTIZED={pre_quantized}')
 " 2>/dev/null || echo "CFG_PARAM_B=
-QUANT_FLAG=fp8
 QUANT_DISPLAY=\"FP8 (online, per Intel spec)\"
-BYTES_PER_PARAM=1.0")"
+BYTES_PER_PARAM=1.0
+PRE_QUANTIZED=0")"
 
 # Param count: config.json -> model name -> default 7
 PARAM_B=""
@@ -684,7 +657,6 @@ if [ -z "$PARAM_B" ]; then
               | grep -ioE '[0-9]+(\.[0-9]+)?' | tail -1 || true)
 fi
 PARAM_B=${PARAM_B:-7}
-QUANT_FLAG=${QUANT_FLAG:-fp8}
 BYTES_PER_PARAM=${BYTES_PER_PARAM:-1.0}
 PRE_QUANTIZED=${PRE_QUANTIZED:-0}
 
@@ -713,10 +685,11 @@ echo -e "${GREEN}  max-model-len: ${MODEL_LEN}${NC}"
 TP_ARG=""
 [ "$GPU_COUNT" -gt 1 ] && TP_ARG="-tp ${GPU_COUNT}"
 
-# For pre-quantized models, some quant methods may be deprecated in newer vLLM
-QUANT_EXTRA_ARGS=""
-if [ "$PRE_QUANTIZED" -eq 1 ]; then
-    QUANT_EXTRA_ARGS="--allow-deprecated-quantization"
+# For pre-quantized models: let vLLM auto-detect from config.json (no --quantization flag)
+# For non-quantized models: apply FP8 online quantization (Intel spec default)
+QUANT_ARGS=""
+if [ "$PRE_QUANTIZED" -eq 0 ]; then
+    QUANT_ARGS="--quantization fp8"
 fi
 
 # ==============================================================================
@@ -749,8 +722,7 @@ sudo docker exec -d "$CONTAINER_NAME" bash -c "
         --disable-log-requests \
         --max-model-len=${MODEL_LEN} \
         --block-size 64 \
-        --quantization ${QUANT_FLAG} \
-        ${QUANT_EXTRA_ARGS} \
+        ${QUANT_ARGS} \
         ${TP_ARG} \
     > /tmp/vllm_server.log 2>&1
 "
