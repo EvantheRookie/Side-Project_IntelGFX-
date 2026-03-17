@@ -583,74 +583,42 @@ case "$MODEL_CHECK" in
 esac
 
 # ==============================================================================
-# STEP 6: Auto-profile model (params, quantization, max-model-len)
+# STEP 6: Auto-profile model from config.json (no guessing)
 # ==============================================================================
 echo -e "\n${CYAN}--- Model Profiling ---${NC}"
 
-# Read model info from config.json AND measure actual weight files on disk
+# Read ALL needed parameters directly from config.json + measure weight files
 eval "$(sudo docker exec "$CONTAINER_NAME" python3 -c "
-import json, sys, os, glob
+import json, os, glob
 
 model_dir = '/llm/models/${MODEL_NAME}'
 cfg = json.load(open(os.path.join(model_dir, 'config.json')))
 
-# --- Actual model size on disk (most reliable VRAM estimate) ---
-# Sum all weight files: .safetensors, .bin, .pt
-weight_bytes = 0
-for ext in ('*.safetensors', '*.bin', '*.pt', 'model-*.safetensors'):
-    for f in glob.glob(os.path.join(model_dir, ext)):
-        weight_bytes += os.path.getsize(f)
-# Also check subdirectories (some models store weights in subfolders)
-for ext in ('**/*.safetensors', '**/*.bin'):
-    for f in glob.glob(os.path.join(model_dir, ext), recursive=True):
-        weight_bytes += os.path.getsize(f)
-# Deduplicate (glob ** may re-match top-level)
+# ---- 1. Actual weight file size on disk (ground truth for VRAM) ----
 seen = set()
 weight_bytes = 0
-for ext in ('*.safetensors', '*.bin', '*.pt'):
-    for f in glob.glob(os.path.join(model_dir, ext)):
+for pattern in ('*.safetensors', '*.bin', '*.pt'):
+    for f in glob.glob(os.path.join(model_dir, pattern)):
         rp = os.path.realpath(f)
         if rp not in seen:
             seen.add(rp)
             weight_bytes += os.path.getsize(f)
-for ext in ('**/*.safetensors', '**/*.bin'):
-    for f in glob.glob(os.path.join(model_dir, ext), recursive=True):
+for pattern in ('**/*.safetensors', '**/*.bin'):
+    for f in glob.glob(os.path.join(model_dir, pattern), recursive=True):
         rp = os.path.realpath(f)
         if rp not in seen:
             seen.add(rp)
             weight_bytes += os.path.getsize(f)
-
 model_size_gb = weight_bytes / (1024**3) if weight_bytes > 0 else 0
 print(f'MODEL_SIZE_GB={model_size_gb:.2f}')
 
-# --- Param count (for display only, not for VRAM calc) ---
-h = cfg.get('hidden_size', 0)
-n = cfg.get('num_hidden_layers', 0)
-v = cfg.get('vocab_size', 0)
-i = cfg.get('intermediate_size', h * 4)
-param_b = ''
-if h > 0 and n > 0:
-    params = v * h + n * (4 * h * h + 3 * h * i)
-    billions = params / 1e9
-    for s in [0.5, 1, 1.5, 2, 3, 4, 7, 8, 9, 13, 14, 15, 32, 34, 70, 72]:
-        if abs(billions - s) / max(s, 1) < 0.3:
-            param_b = str(s); break
-    if not param_b:
-        param_b = f'{billions:.1f}'
-print(f'CFG_PARAM_B={param_b}')
-
-# --- Quantization detection ---
-# For pre-quantized models, vLLM auto-detects the method from config.json.
-# We do NOT pass --quantization for pre-quantized models to avoid:
-#   - deprecated method errors (e.g. auto-round in vLLM 0.14+)
-#   - name mismatches between config.json and vLLM's expected flag names
+# ---- 2. Quantization (read directly from config.json) ----
 qcfg = cfg.get('quantization_config', {})
 quant_method = qcfg.get('quant_method', '').lower()
 quant_bits = qcfg.get('bits', 0)
 
-quant_display = ''
 pre_quantized = 0
-
+quant_display = ''
 if quant_method:
     pre_quantized = 1
     bits = quant_bits or 4
@@ -660,15 +628,72 @@ if quant_method:
         quant_display = f'{quant_method} INT{bits} (pre-quantized, auto-detected)'
 else:
     quant_display = 'FP8 (online, per Intel spec)'
-
 print(f'QUANT_DISPLAY=\"{quant_display}\"')
 print(f'PRE_QUANTIZED={pre_quantized}')
+
+# ---- 3. KV cache dimensions (read directly from config.json) ----
+# These are the REAL values vLLM uses for KV cache allocation.
+# For hybrid models (Qwen3-Next etc.), check text_config too.
+tc = cfg.get('text_config', cfg)  # some VL models nest under text_config
+
+num_layers = tc.get('num_hidden_layers', cfg.get('num_hidden_layers', 0))
+num_kv_heads = tc.get('num_key_value_heads',
+               tc.get('num_attention_heads',
+               cfg.get('num_key_value_heads',
+               cfg.get('num_attention_heads', 0))))
+head_dim = tc.get('head_dim', 0)
+if head_dim == 0:
+    hidden = tc.get('hidden_size', cfg.get('hidden_size', 0))
+    n_heads = tc.get('num_attention_heads', cfg.get('num_attention_heads', 1))
+    head_dim = hidden // n_heads if n_heads > 0 else 0
+
+print(f'NUM_LAYERS={num_layers}')
+print(f'NUM_KV_HEADS={num_kv_heads}')
+print(f'HEAD_DIM={head_dim}')
+
+# ---- 4. Max context length from config.json ----
+max_pos = tc.get('max_position_embeddings',
+          cfg.get('max_position_embeddings', 0))
+# Some models use other names
+if max_pos == 0:
+    max_pos = tc.get('max_sequence_length',
+              tc.get('seq_length',
+              cfg.get('max_sequence_length',
+              cfg.get('seq_length', 0))))
+print(f'MAX_POS_EMBED={max_pos}')
+
+# ---- 5. Param count from file size (not from architecture formula) ----
+if weight_bytes > 0 and quant_method:
+    bits = quant_bits or 4
+    # For quantized models: file_size / (bits/8) gives true param count
+    # (approximate, as not all tensors are quantized, but much better than formula)
+    param_b_est = (weight_bytes / (bits / 8)) / 1e9
+    # Also include non-quantized overhead (~20% of params are in fp16 embeddings etc)
+    param_b_est = param_b_est * 0.85  # discount for mixed precision
+elif weight_bytes > 0:
+    # fp16 model
+    param_b_est = (weight_bytes / 2) / 1e9
+else:
+    param_b_est = 0
+# Snap to known sizes for display
+param_b = ''
+if param_b_est > 0:
+    for s in [0.5, 1, 1.5, 2, 3, 4, 7, 8, 9, 13, 14, 15, 32, 34, 70, 72]:
+        if abs(param_b_est - s) / max(s, 1) < 0.25:
+            param_b = str(s); break
+    if not param_b:
+        param_b = f'{param_b_est:.1f}'
+print(f'CFG_PARAM_B={param_b}')
 " 2>/dev/null || echo "CFG_PARAM_B=
 MODEL_SIZE_GB=0
 QUANT_DISPLAY=\"FP8 (online, per Intel spec)\"
-PRE_QUANTIZED=0")"
+PRE_QUANTIZED=0
+NUM_LAYERS=0
+NUM_KV_HEADS=0
+HEAD_DIM=0
+MAX_POS_EMBED=0")"
 
-# Param count: config.json -> model name -> default 7 (for display/fallback)
+# Apply defaults
 PARAM_B=""
 if [ -n "$CFG_PARAM_B" ]; then
     PARAM_B="$CFG_PARAM_B"
@@ -680,52 +705,75 @@ fi
 PARAM_B=${PARAM_B:-7}
 MODEL_SIZE_GB=${MODEL_SIZE_GB:-0}
 PRE_QUANTIZED=${PRE_QUANTIZED:-0}
+NUM_LAYERS=${NUM_LAYERS:-0}
+NUM_KV_HEADS=${NUM_KV_HEADS:-0}
+HEAD_DIM=${HEAD_DIM:-0}
+MAX_POS_EMBED=${MAX_POS_EMBED:-0}
 
-# Calculate max-model-len based on ACTUAL model file size on disk
-# This is far more reliable than estimating from architecture params,
-# because hybrid models (mamba+attention like Qwen3-Next) have extra
-# state parameters that the simple transformer formula misses.
-#
-# If we couldn't measure file size, fall back to conservative estimate.
-# vLLM runtime overhead: ~1.5x the weight file size (activations, buffers, etc.)
-# For non-quantized models with FP8 online: weights loaded as fp16, then quantized,
-# so peak VRAM is fp16 size during loading.
+# ---- Early VRAM check: fail fast if model can't possibly fit ----
+if [ "$(echo "$MODEL_SIZE_GB $VRAM_GIB" | awk '{print ($1 > $2)}')" = "1" ]; then
+    echo -e "${RED}[FAIL] Model weights are ${MODEL_SIZE_GB} GB but GPU only has ${VRAM_GIB} GiB VRAM.${NC}"
+    echo -e "${RED}  This model cannot fit in your GPU memory.${NC}"
+    echo -e "${YELLOW}  Options:${NC}"
+    echo -e "${YELLOW}    1. Use a smaller/more quantized variant of this model${NC}"
+    echo -e "${YELLOW}    2. Use a smaller model (e.g. 7B instead of 70B)${NC}"
+    if [ "$GPU_COUNT" -eq 1 ]; then
+        echo -e "${YELLOW}    3. Add more GPUs and use tensor parallelism${NC}"
+    fi
+    exit 1
+fi
+
+# ---- Calculate max-model-len from REAL config values ----
+# KV cache per token per layer = 2 * num_kv_heads * head_dim * dtype_bytes (fp16=2)
+# Total KV per token = num_layers * kv_per_token_per_layer
+# Available VRAM for KV = total_vram * gpu_util - model_weights - overhead
 MODEL_LEN=$(awk -v vram="$VRAM_GIB" -v model_gb="$MODEL_SIZE_GB" \
-                -v pb="$PARAM_B" -v pre_q="$PRE_QUANTIZED" '
+                -v num_layers="$NUM_LAYERS" -v num_kv_heads="$NUM_KV_HEADS" \
+                -v head_dim="$HEAD_DIM" -v max_pos="$MAX_POS_EMBED" \
+                -v pre_q="$PRE_QUANTIZED" -v pb="$PARAM_B" '
 BEGIN {
-    usable = vram * 0.85  # conservative: leave 15% headroom for driver/OS
+    usable_gb = vram * 0.85  # leave 15% for driver/OS/fragmentation
 
+    # Model weight VRAM = file size on disk (what gets loaded)
+    # Plus ~20% overhead for activations, optimizer states, buffers
     if (model_gb > 0) {
-        # Use actual measured file size
-        # Runtime overhead: ~1.5x for activations, KV cache metadata, etc.
-        if (pre_q == 0) {
-            # Non-quantized + FP8 online: peak at fp16 during load, then ~model_gb after quant
-            # Use 2.0 as fp16 bytes/param, weight files are fp16
-            runtime_gb = model_gb * 1.5
-        } else {
-            # Pre-quantized: weight file = actual VRAM usage + overhead
-            runtime_gb = model_gb * 1.5
-        }
+        weight_vram = model_gb * 1.2
+    } else if (pre_q == 1) {
+        weight_vram = pb * 0.5 * 1.2
     } else {
-        # Fallback: conservative estimate from param count
-        if (pre_q == 1) {
-            runtime_gb = pb * 0.5 * 1.5  # INT4 estimate
-        } else {
-            runtime_gb = pb * 1.0 * 1.5  # FP8 estimate
-        }
+        weight_vram = pb * 1.0 * 1.2
     }
 
-    kv_avail = usable - runtime_gb
-    if (kv_avail < 0.3) kv_avail = 0.3
+    kv_avail_gb = usable_gb - weight_vram
+    if (kv_avail_gb <= 0) {
+        # Model barely fits, use minimum context
+        printf "%d", 512
+        exit
+    }
 
-    # KV cache per token scales with model size
-    kv_per_token_mb = pb * 0.10
-    if (kv_per_token_mb < 0.05) kv_per_token_mb = 0.05
+    # KV cache per token (bytes) from REAL config values
+    if (num_layers > 0 && num_kv_heads > 0 && head_dim > 0) {
+        # 2 = key + value, 2 = fp16 bytes
+        kv_bytes_per_token = num_layers * 2 * num_kv_heads * head_dim * 2
+    } else {
+        # Fallback: rough estimate based on param count
+        kv_bytes_per_token = pb * 100000  # ~0.1 MB per billion params per token
+    }
 
-    raw = (kv_avail * 1024) / kv_per_token_mb
+    if (kv_bytes_per_token > 0) {
+        kv_avail_bytes = kv_avail_gb * 1024 * 1024 * 1024
+        raw = kv_avail_bytes / kv_bytes_per_token
+    } else {
+        raw = 2048
+    }
+
+    # Cap at model max context length from config.json
+    if (max_pos > 0 && raw > max_pos) raw = max_pos
+
+    # Clamp and align
     if (raw < 512)    raw = 512
     if (raw > 32768)  raw = 32768
-    len = int(raw / 256) * 256  # align to 256 tokens
+    len = int(raw / 256) * 256
     printf "%d", len
 }')
 
@@ -735,6 +783,12 @@ if [ "$(echo "$MODEL_SIZE_GB" | awk '{print ($1 > 0)}')" = "1" ]; then
 fi
 echo -e "  VRAM:        ${VRAM_GIB} GiB x ${GPU_COUNT} GPU(s)"
 echo -e "  Quantization: ${QUANT_DISPLAY}"
+if [ "$NUM_LAYERS" -gt 0 ] && [ "$NUM_KV_HEADS" -gt 0 ]; then
+    echo -e "  KV config:   ${NUM_LAYERS} layers, ${NUM_KV_HEADS} KV heads, head_dim=${HEAD_DIM}"
+fi
+if [ "$MAX_POS_EMBED" -gt 0 ]; then
+    echo -e "  Model max context: ${MAX_POS_EMBED}"
+fi
 echo -e "${GREEN}  max-model-len: ${MODEL_LEN}${NC}"
 
 TP_ARG=""
