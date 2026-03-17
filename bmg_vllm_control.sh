@@ -587,14 +587,43 @@ esac
 # ==============================================================================
 echo -e "\n${CYAN}--- Model Profiling ---${NC}"
 
-# Read param count AND quantization from config.json in one pass
+# Read model info from config.json AND measure actual weight files on disk
 eval "$(sudo docker exec "$CONTAINER_NAME" python3 -c "
-import json, sys, os
+import json, sys, os, glob
 
 model_dir = '/llm/models/${MODEL_NAME}'
 cfg = json.load(open(os.path.join(model_dir, 'config.json')))
 
-# --- Param count ---
+# --- Actual model size on disk (most reliable VRAM estimate) ---
+# Sum all weight files: .safetensors, .bin, .pt
+weight_bytes = 0
+for ext in ('*.safetensors', '*.bin', '*.pt', 'model-*.safetensors'):
+    for f in glob.glob(os.path.join(model_dir, ext)):
+        weight_bytes += os.path.getsize(f)
+# Also check subdirectories (some models store weights in subfolders)
+for ext in ('**/*.safetensors', '**/*.bin'):
+    for f in glob.glob(os.path.join(model_dir, ext), recursive=True):
+        weight_bytes += os.path.getsize(f)
+# Deduplicate (glob ** may re-match top-level)
+seen = set()
+weight_bytes = 0
+for ext in ('*.safetensors', '*.bin', '*.pt'):
+    for f in glob.glob(os.path.join(model_dir, ext)):
+        rp = os.path.realpath(f)
+        if rp not in seen:
+            seen.add(rp)
+            weight_bytes += os.path.getsize(f)
+for ext in ('**/*.safetensors', '**/*.bin'):
+    for f in glob.glob(os.path.join(model_dir, ext), recursive=True):
+        rp = os.path.realpath(f)
+        if rp not in seen:
+            seen.add(rp)
+            weight_bytes += os.path.getsize(f)
+
+model_size_gb = weight_bytes / (1024**3) if weight_bytes > 0 else 0
+print(f'MODEL_SIZE_GB={model_size_gb:.2f}')
+
+# --- Param count (for display only, not for VRAM calc) ---
 h = cfg.get('hidden_size', 0)
 n = cfg.get('num_hidden_layers', 0)
 v = cfg.get('vocab_size', 0)
@@ -615,39 +644,31 @@ print(f'CFG_PARAM_B={param_b}')
 # We do NOT pass --quantization for pre-quantized models to avoid:
 #   - deprecated method errors (e.g. auto-round in vLLM 0.14+)
 #   - name mismatches between config.json and vLLM's expected flag names
-# We only need bytes_per_param for VRAM/max-model-len calculation.
 qcfg = cfg.get('quantization_config', {})
 quant_method = qcfg.get('quant_method', '').lower()
 quant_bits = qcfg.get('bits', 0)
 
 quant_display = ''
-bytes_per_param = 2.0  # default fp16
 pre_quantized = 0
 
 if quant_method:
     pre_quantized = 1
     bits = quant_bits or 4
-    # Estimate bytes-per-param for VRAM calculation
     if quant_method in ('fp8', 'fbgemm_fp8'):
-        bytes_per_param = 1.0
         quant_display = f'FP8 (pre-quantized, auto-detected)'
     else:
-        bytes_per_param = bits / 8.0
         quant_display = f'{quant_method} INT{bits} (pre-quantized, auto-detected)'
 else:
-    # No pre-quantization: use FP8 online (Intel spec default)
-    bytes_per_param = 1.0
     quant_display = 'FP8 (online, per Intel spec)'
 
 print(f'QUANT_DISPLAY=\"{quant_display}\"')
-print(f'BYTES_PER_PARAM={bytes_per_param}')
 print(f'PRE_QUANTIZED={pre_quantized}')
 " 2>/dev/null || echo "CFG_PARAM_B=
+MODEL_SIZE_GB=0
 QUANT_DISPLAY=\"FP8 (online, per Intel spec)\"
-BYTES_PER_PARAM=1.0
 PRE_QUANTIZED=0")"
 
-# Param count: config.json -> model name -> default 7
+# Param count: config.json -> model name -> default 7 (for display/fallback)
 PARAM_B=""
 if [ -n "$CFG_PARAM_B" ]; then
     PARAM_B="$CFG_PARAM_B"
@@ -657,29 +678,63 @@ if [ -z "$PARAM_B" ]; then
               | grep -ioE '[0-9]+(\.[0-9]+)?' | tail -1 || true)
 fi
 PARAM_B=${PARAM_B:-7}
-BYTES_PER_PARAM=${BYTES_PER_PARAM:-1.0}
+MODEL_SIZE_GB=${MODEL_SIZE_GB:-0}
 PRE_QUANTIZED=${PRE_QUANTIZED:-0}
 
-# Calculate max-model-len based on actual quantization
-# Model memory = params_B * bytes_per_param * 1.05 (overhead)
-# KV cache per token ~= params_B * 0.10 MB
-MODEL_LEN=$(awk -v vram="$VRAM_GIB" -v pb="$PARAM_B" -v bpp="$BYTES_PER_PARAM" '
+# Calculate max-model-len based on ACTUAL model file size on disk
+# This is far more reliable than estimating from architecture params,
+# because hybrid models (mamba+attention like Qwen3-Next) have extra
+# state parameters that the simple transformer formula misses.
+#
+# If we couldn't measure file size, fall back to conservative estimate.
+# vLLM runtime overhead: ~1.5x the weight file size (activations, buffers, etc.)
+# For non-quantized models with FP8 online: weights loaded as fp16, then quantized,
+# so peak VRAM is fp16 size during loading.
+MODEL_LEN=$(awk -v vram="$VRAM_GIB" -v model_gb="$MODEL_SIZE_GB" \
+                -v pb="$PARAM_B" -v pre_q="$PRE_QUANTIZED" '
 BEGIN {
-    usable = vram * 0.9
-    model_gb = pb * bpp * 1.05
-    kv_avail = usable - model_gb
-    if (kv_avail < 0.5) kv_avail = 0.5
-    raw = (kv_avail * 1024) / (pb * 0.10)
-    if (raw < 2048)   raw = 2048
+    usable = vram * 0.85  # conservative: leave 15% headroom for driver/OS
+
+    if (model_gb > 0) {
+        # Use actual measured file size
+        # Runtime overhead: ~1.5x for activations, KV cache metadata, etc.
+        if (pre_q == 0) {
+            # Non-quantized + FP8 online: peak at fp16 during load, then ~model_gb after quant
+            # Use 2.0 as fp16 bytes/param, weight files are fp16
+            runtime_gb = model_gb * 1.5
+        } else {
+            # Pre-quantized: weight file = actual VRAM usage + overhead
+            runtime_gb = model_gb * 1.5
+        }
+    } else {
+        # Fallback: conservative estimate from param count
+        if (pre_q == 1) {
+            runtime_gb = pb * 0.5 * 1.5  # INT4 estimate
+        } else {
+            runtime_gb = pb * 1.0 * 1.5  # FP8 estimate
+        }
+    }
+
+    kv_avail = usable - runtime_gb
+    if (kv_avail < 0.3) kv_avail = 0.3
+
+    # KV cache per token scales with model size
+    kv_per_token_mb = pb * 0.10
+    if (kv_per_token_mb < 0.05) kv_per_token_mb = 0.05
+
+    raw = (kv_avail * 1024) / kv_per_token_mb
+    if (raw < 512)    raw = 512
     if (raw > 32768)  raw = 32768
-    len = int(raw / 512) * 512
+    len = int(raw / 256) * 256  # align to 256 tokens
     printf "%d", len
 }')
 
 echo -e "  Model size:  ~${PARAM_B}B params"
+if [ "$(echo "$MODEL_SIZE_GB" | awk '{print ($1 > 0)}')" = "1" ]; then
+    echo -e "  Weight files: ${MODEL_SIZE_GB} GB on disk"
+fi
 echo -e "  VRAM:        ${VRAM_GIB} GiB x ${GPU_COUNT} GPU(s)"
 echo -e "  Quantization: ${QUANT_DISPLAY}"
-echo -e "  Bytes/param: ${BYTES_PER_PARAM}"
 echo -e "${GREEN}  max-model-len: ${MODEL_LEN}${NC}"
 
 TP_ARG=""
@@ -697,69 +752,110 @@ else
 fi
 
 # ==============================================================================
-# STEP 7: Start vLLM server (Intel spec)
+# STEP 7: Start vLLM server (Intel spec) with OOM auto-retry
 # ==============================================================================
+
+start_vllm_server() {
+    local cur_model_len=$1
+
+    sudo docker exec "$CONTAINER_NAME" pkill -f "vllm serve" 2>/dev/null || true
+    sleep 2
+    sudo docker exec "$CONTAINER_NAME" bash -c "> /tmp/vllm_server.log"
+
+    echo -e "${YELLOW}Starting vLLM server (port ${VLLM_PORT}, max-model-len=${cur_model_len})...${NC}"
+    sudo docker exec -d "$CONTAINER_NAME" bash -c "
+        source /opt/intel/oneapi/setvars.sh --force 2>/dev/null || true
+        VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
+        VLLM_WORKER_MULTIPROC_METHOD=spawn \
+        vllm serve /llm/models/${MODEL_NAME} \
+            --served-model-name ${MODEL_NAME} \
+            --dtype=float16 \
+            --enforce-eager \
+            --port ${VLLM_PORT} \
+            --host 0.0.0.0 \
+            --trust-remote-code \
+            --disable-sliding-window \
+            --gpu-memory-util=0.9 \
+            --max-num-batched-tokens=${cur_model_len} \
+            --disable-log-requests \
+            --max-model-len=${cur_model_len} \
+            --block-size 64 \
+            ${QUANT_ARGS} \
+            ${TP_ARG} \
+        > /tmp/vllm_server.log 2>&1
+    "
+
+    echo -e "${CYAN}  Log: sudo docker exec ${CONTAINER_NAME} tail -f /tmp/vllm_server.log${NC}"
+    echo -e "${YELLOW}Waiting for server...${NC}"
+
+    local N=0
+    while ! curl -sf "http://localhost:${VLLM_PORT}/v1/models" >/dev/null 2>&1; do
+        sleep 5; N=$((N+1))
+
+        # Show progress every 30s
+        if [ $((N % 6)) -eq 0 ]; then
+            LAST_LINE=$(sudo docker exec "$CONTAINER_NAME" tail -1 /tmp/vllm_server.log 2>/dev/null || echo "")
+            echo -e "\n  ${CYAN}[${N}0s] ${LAST_LINE}${NC}"
+        else
+            echo -n "."
+        fi
+
+        # Crash detection — check if process died
+        if ! sudo docker exec "$CONTAINER_NAME" pgrep -f "vllm" >/dev/null 2>&1; then
+            # Check if OOM
+            if sudo docker exec "$CONTAINER_NAME" grep -qi "OUT_OF.*MEMORY\|CUDA out of memory\|out of memory\|UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY" /tmp/vllm_server.log 2>/dev/null; then
+                echo -e "\n${RED}[OOM] Out of GPU memory at max-model-len=${cur_model_len}${NC}"
+                return 2  # OOM exit code
+            fi
+            echo -e "\n${RED}[FAIL] Server crashed. Full log:${NC}"
+            sudo docker exec "$CONTAINER_NAME" cat /tmp/vllm_server.log
+            return 1  # non-OOM crash
+        fi
+
+        if [ $N -ge 60 ]; then
+            echo -e "\n${RED}[FAIL] Timeout (5 min). Log:${NC}"
+            sudo docker exec "$CONTAINER_NAME" tail -30 /tmp/vllm_server.log
+            return 1
+        fi
+    done
+    echo -e "\n${GREEN}[OK] Server ready (max-model-len=${cur_model_len}).${NC}"
+    return 0
+}
+
 echo -e "\n${CYAN}--- Starting vLLM Server ---${NC}"
 
-# Kill any existing vllm
-sudo docker exec "$CONTAINER_NAME" pkill -f "vllm serve" 2>/dev/null || true
-sleep 2
-sudo docker exec "$CONTAINER_NAME" bash -c "> /tmp/vllm_server.log"
+# Try starting with calculated MODEL_LEN, auto-retry with halved value on OOM
+VLLM_STARTED=false
+CURRENT_MODEL_LEN=$MODEL_LEN
+MAX_OOM_RETRIES=3
 
-# Start server matching Intel llm-scaler README exactly:
-# https://github.com/intel/llm-scaler/blob/main/vllm/README.md
-echo -e "${YELLOW}Starting vLLM server (port ${VLLM_PORT})...${NC}"
-sudo docker exec -d "$CONTAINER_NAME" bash -c "
-    source /opt/intel/oneapi/setvars.sh --force 2>/dev/null || true
-    VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
-    VLLM_WORKER_MULTIPROC_METHOD=spawn \
-    vllm serve /llm/models/${MODEL_NAME} \
-        --served-model-name ${MODEL_NAME} \
-        --dtype=float16 \
-        --enforce-eager \
-        --port ${VLLM_PORT} \
-        --host 0.0.0.0 \
-        --trust-remote-code \
-        --disable-sliding-window \
-        --gpu-memory-util=0.9 \
-        --max-num-batched-tokens=8192 \
-        --disable-log-requests \
-        --max-model-len=${MODEL_LEN} \
-        --block-size 64 \
-        ${QUANT_ARGS} \
-        ${TP_ARG} \
-    > /tmp/vllm_server.log 2>&1
-"
-
-echo -e "${CYAN}  Log: sudo docker exec ${CONTAINER_NAME} tail -f /tmp/vllm_server.log${NC}"
-echo -e "${YELLOW}Waiting for server...${NC}"
-
-N=0
-while ! curl -sf "http://localhost:${VLLM_PORT}/v1/models" >/dev/null 2>&1; do
-    sleep 5; N=$((N+1))
-
-    # Show progress every 30s
-    if [ $((N % 6)) -eq 0 ]; then
-        LAST_LINE=$(sudo docker exec "$CONTAINER_NAME" tail -1 /tmp/vllm_server.log 2>/dev/null || echo "")
-        echo -e "\n  ${CYAN}[${N}0s] ${LAST_LINE}${NC}"
+for attempt in $(seq 1 $((MAX_OOM_RETRIES + 1))); do
+    start_vllm_server "$CURRENT_MODEL_LEN"
+    rc=$?
+    if [ $rc -eq 0 ]; then
+        VLLM_STARTED=true
+        MODEL_LEN=$CURRENT_MODEL_LEN
+        break
+    elif [ $rc -eq 2 ]; then
+        # OOM — halve max-model-len and retry
+        CURRENT_MODEL_LEN=$(( CURRENT_MODEL_LEN / 2 ))
+        # Floor at 512
+        [ "$CURRENT_MODEL_LEN" -lt 512 ] && CURRENT_MODEL_LEN=512
+        if [ $attempt -le $MAX_OOM_RETRIES ]; then
+            echo -e "${YELLOW}  Retrying with max-model-len=${CURRENT_MODEL_LEN}...${NC}"
+        fi
     else
-        echo -n "."
-    fi
-
-    # Crash detection
-    if ! sudo docker exec "$CONTAINER_NAME" pgrep -f "vllm" >/dev/null 2>&1; then
-        echo -e "\n${RED}[FAIL] Server crashed. Full log:${NC}"
-        sudo docker exec "$CONTAINER_NAME" cat /tmp/vllm_server.log
-        exit 1
-    fi
-
-    if [ $N -ge 60 ]; then
-        echo -e "\n${RED}[FAIL] Timeout (5 min). Log:${NC}"
-        sudo docker exec "$CONTAINER_NAME" tail -30 /tmp/vllm_server.log
+        # Non-OOM crash — don't retry
         exit 1
     fi
 done
-echo -e "\n${GREEN}[OK] Server ready.${NC}"
+
+if [ "$VLLM_STARTED" = false ]; then
+    echo -e "${RED}[FAIL] Could not start vLLM even with max-model-len=${CURRENT_MODEL_LEN}.${NC}"
+    echo -e "${RED}  The model is too large for your GPU's ${VRAM_GIB} GiB VRAM.${NC}"
+    echo -e "${YELLOW}  Try a smaller model or a more aggressively quantized variant.${NC}"
+    exit 1
+fi
 
 # ==============================================================================
 # STEP 8: Run benchmark (Intel spec)
