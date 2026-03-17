@@ -664,9 +664,11 @@ else:
     quant_display = 'FP8 (online, per Intel spec)'
     bytes_per_param = 1.0
 
+pre_quantized = 1 if quant_method else 0
 print(f'QUANT_FLAG={quant_flag}')
 print(f'QUANT_DISPLAY=\"{quant_display}\"')
 print(f'BYTES_PER_PARAM={bytes_per_param}')
+print(f'PRE_QUANTIZED={pre_quantized}')
 " 2>/dev/null || echo "CFG_PARAM_B=
 QUANT_FLAG=fp8
 QUANT_DISPLAY=\"FP8 (online, per Intel spec)\"
@@ -684,6 +686,7 @@ fi
 PARAM_B=${PARAM_B:-7}
 QUANT_FLAG=${QUANT_FLAG:-fp8}
 BYTES_PER_PARAM=${BYTES_PER_PARAM:-1.0}
+PRE_QUANTIZED=${PRE_QUANTIZED:-0}
 
 # Calculate max-model-len based on actual quantization
 # Model memory = params_B * bytes_per_param * 1.05 (overhead)
@@ -709,6 +712,12 @@ echo -e "${GREEN}  max-model-len: ${MODEL_LEN}${NC}"
 
 TP_ARG=""
 [ "$GPU_COUNT" -gt 1 ] && TP_ARG="-tp ${GPU_COUNT}"
+
+# For pre-quantized models, some quant methods may be deprecated in newer vLLM
+QUANT_EXTRA_ARGS=""
+if [ "$PRE_QUANTIZED" -eq 1 ]; then
+    QUANT_EXTRA_ARGS="--allow-deprecated-quantization"
+fi
 
 # ==============================================================================
 # STEP 7: Start vLLM server (Intel spec)
@@ -741,6 +750,7 @@ sudo docker exec -d "$CONTAINER_NAME" bash -c "
         --max-model-len=${MODEL_LEN} \
         --block-size 64 \
         --quantization ${QUANT_FLAG} \
+        ${QUANT_EXTRA_ARGS} \
         ${TP_ARG} \
     > /tmp/vllm_server.log 2>&1
 "
