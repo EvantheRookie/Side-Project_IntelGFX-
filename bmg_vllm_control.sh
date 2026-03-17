@@ -686,9 +686,13 @@ TP_ARG=""
 [ "$GPU_COUNT" -gt 1 ] && TP_ARG="-tp ${GPU_COUNT}"
 
 # For pre-quantized models: let vLLM auto-detect from config.json (no --quantization flag)
+#   BUT pass --allow-deprecated-quantization because vLLM still reads quantization_config
+#   from config.json and will reject deprecated methods (e.g. auto-round) without it.
 # For non-quantized models: apply FP8 online quantization (Intel spec default)
 QUANT_ARGS=""
-if [ "$PRE_QUANTIZED" -eq 0 ]; then
+if [ "$PRE_QUANTIZED" -eq 1 ]; then
+    QUANT_ARGS="--allow-deprecated-quantization"
+else
     QUANT_ARGS="--quantization fp8"
 fi
 
