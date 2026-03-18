@@ -2,6 +2,7 @@
 # ==============================================================================
 # BMG vLLM Benchmark Script (Intel llm-scaler spec)
 # Fully automatic benchmark for Intel Arc Battlemage GPUs
+# Supports: text generation, embedding, reranker, multimodal, omni
 # Ref: https://github.com/intel/llm-scaler/blob/main/vllm/README.md
 # Ref: https://github.com/intel/llm-scaler/blob/main/Releases.md
 # ==============================================================================
@@ -569,7 +570,7 @@ case "$MODEL_CHECK" in
         echo -e "${GREEN}[OK] Model compatible (reward).${NC}"
         ;;
     OK_MULTIMODAL*)
-        MODEL_TASK="generate"
+        MODEL_TASK="multimodal"
         echo -e "${GREEN}[OK] Model compatible (vision/multimodal).${NC}"
         ;;
     OK_GENERATE*)
@@ -802,38 +803,78 @@ echo -e "${GREEN}  max-model-len: ${MODEL_LEN}${NC}"
 # Tensor parallelism: always pass -tp (even for 1 GPU, for explicitness)
 TP_ARG="-tp ${GPU_COUNT}"
 
-# --- Build vLLM flags based on model type and quantization ---
-# Pre-quantized: let vLLM auto-detect from config.json, add --allow-deprecated-quantization
-# Non-quantized: apply FP8 online quantization (Intel spec default)
+# --- Build all vLLM flags per Intel llm-scaler spec ---
+# Ref: https://github.com/intel/llm-scaler/blob/main/vllm/README.md
+
+# Quantization: pre-quantized models auto-detected, online quant for unquantized
 QUANT_ARGS=""
 if [ "$PRE_QUANTIZED" -eq 1 ]; then
+    # Pre-quantized (GPTQ/AWQ/AutoRound): vLLM reads from config.json, no --quantization needed
     QUANT_ARGS="--allow-deprecated-quantization"
 else
-    QUANT_ARGS="--quantization fp8"
+    # Non-quantized: let user choose online quantization method
+    echo ""
+    echo -e "${CYAN}Select online quantization for unquantized model:${NC}"
+    echo -e "  ${GREEN}1)${NC} FP8  (default, best balance of speed/accuracy)"
+    echo -e "  ${GREEN}2)${NC} INT4 (sym_int4, lower VRAM, lower accuracy)"
+    echo -e "  ${GREEN}3)${NC} None (use model's native dtype, highest VRAM usage)"
+    read -p "Quantization [1]: " QUANT_CHOICE
+    QUANT_CHOICE="${QUANT_CHOICE:-1}"
+    case "$QUANT_CHOICE" in
+        2)  QUANT_ARGS="--quantization sym_int4"
+            echo -e "  Selected: ${YELLOW}sym_int4${NC}"
+            ;;
+        3)  QUANT_ARGS=""
+            echo -e "  Selected: ${YELLOW}None (native dtype)${NC}"
+            ;;
+        *)  QUANT_ARGS="--quantization fp8"
+            echo -e "  Selected: ${GREEN}FP8${NC}"
+            ;;
+    esac
 fi
 
-# Task/runner flag: detect what this vLLM version supports
-# - vLLM <= 0.8: --task embed / --task score
-# - vLLM 0.10-0.13: --task (deprecated but works)
-# - vLLM 0.14+: --task removed, auto-detects model type; use --runner pooling if needed
+# Task flag: per Intel llm-scaler spec (their vLLM build supports --task)
+# Ref: Section 2.3 of Intel README
 TASK_ARGS=""
-if [ "$MODEL_TASK" != "generate" ]; then
-    # Check if this vLLM supports --task or --runner
-    VLLM_HELP=$(sudo docker exec "$CONTAINER_NAME" vllm serve --help 2>&1 || true)
-    if echo "$VLLM_HELP" | grep -q '\-\-task'; then
-        # Old vLLM with --task support
-        if [ "$MODEL_TASK" = "embed" ]; then
-            TASK_ARGS="--task embed"
-        elif [ "$MODEL_TASK" = "score" ]; then
-            TASK_ARGS="--task score"
-        elif [ "$MODEL_TASK" = "reward" ]; then
-            TASK_ARGS="--task reward"
-        fi
-    elif echo "$VLLM_HELP" | grep -q '\-\-runner'; then
-        # vLLM 0.14+ with --runner
-        TASK_ARGS="--runner pooling"
-    fi
-    # If neither flag found, omit — vLLM auto-detects
+if [ "$MODEL_TASK" = "embed" ]; then
+    TASK_ARGS="--task embed"
+elif [ "$MODEL_TASK" = "score" ]; then
+    TASK_ARGS="--task score"
+elif [ "$MODEL_TASK" = "reward" ]; then
+    TASK_ARGS="--task reward"
+fi
+
+# Per-task-type flags from Intel spec:
+# - Embed/Score: --no-enable-prefix-caching, max-num-batched-tokens=2048
+# - Multimodal VL: no --disable-sliding-window, --allowed-local-media-path, max-num-batched-tokens=5120
+# - Text generation: --disable-sliding-window, max-num-batched-tokens=8192
+EXTRA_ARGS=""
+BATCHED_TOKENS=8192
+IS_MULTIMODAL=false
+
+case "$MODEL_TASK" in
+    embed|score|reward)
+        # Intel spec section 2.3: prefix caching off, lower batched tokens
+        EXTRA_ARGS="--no-enable-prefix-caching"
+        BATCHED_TOKENS=2048
+        ;;
+    multimodal)
+        # Intel spec section 2.4: no --disable-sliding-window, need media path
+        IS_MULTIMODAL=true
+        EXTRA_ARGS="--allowed-local-media-path /llm/models/test --no-enable-prefix-caching"
+        BATCHED_TOKENS=5120
+        sudo docker exec "$CONTAINER_NAME" mkdir -p /llm/models/test 2>/dev/null || true
+        ;;
+    generate)
+        # Intel spec section 1.4.1: standard text generation
+        EXTRA_ARGS="--disable-sliding-window"
+        BATCHED_TOKENS=8192
+        ;;
+esac
+
+# Cap batched tokens to max-model-len
+if [ "$BATCHED_TOKENS" -gt "$MODEL_LEN" ]; then
+    BATCHED_TOKENS=$MODEL_LEN
 fi
 
 # ==============================================================================
@@ -842,16 +883,29 @@ fi
 
 start_vllm_server() {
     local cur_model_len=$1
+    local cur_batched=$BATCHED_TOKENS
+    # Cap batched tokens to model len
+    [ "$cur_batched" -gt "$cur_model_len" ] && cur_batched=$cur_model_len
 
     sudo docker exec "$CONTAINER_NAME" pkill -f "vllm serve" 2>/dev/null || true
     sleep 2
-    sudo docker exec "$CONTAINER_NAME" bash -c "> /tmp/vllm_server.log"
+    sudo docker exec "$CONTAINER_NAME" bash -c "> /llm/vllm.log"
 
     echo -e "${YELLOW}Starting vLLM server (port ${VLLM_PORT}, task=${MODEL_TASK}, max-model-len=${cur_model_len})...${NC}"
+
+    # Build the command matching Intel llm-scaler spec exactly
+    # Ref: https://github.com/intel/llm-scaler/blob/main/vllm/README.md
+    # Log to /llm/vllm.log and Docker stdout per Intel spec
+    local CCL_ENV=""
+    if [ "$GPU_COUNT" -gt 1 ]; then
+        CCL_ENV="CCL_TOPO_P2P_ACCESS=1"
+    fi
+
     sudo docker exec -d "$CONTAINER_NAME" bash -c "
         source /opt/intel/oneapi/setvars.sh --force 2>/dev/null || true
         VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
         VLLM_WORKER_MULTIPROC_METHOD=spawn \
+        ${CCL_ENV} \
         vllm serve /llm/models/${MODEL_NAME} \
             --served-model-name ${MODEL_NAME} \
             --dtype=float16 \
@@ -859,19 +913,21 @@ start_vllm_server() {
             --port ${VLLM_PORT} \
             --host 0.0.0.0 \
             --trust-remote-code \
-            --disable-sliding-window \
             --gpu-memory-util=0.9 \
-            --max-num-batched-tokens=${cur_model_len} \
+            --max-num-batched-tokens=${cur_batched} \
             --disable-log-requests \
             --max-model-len=${cur_model_len} \
             --block-size 64 \
             ${TASK_ARGS} \
+            ${EXTRA_ARGS} \
             ${QUANT_ARGS} \
             ${TP_ARG} \
-        > /tmp/vllm_server.log 2>&1
+        2>&1 | tee /llm/vllm.log > /proc/1/fd/1 &
+        # Wait for background process
+        wait
     "
 
-    echo -e "${CYAN}  Log: sudo docker exec ${CONTAINER_NAME} tail -f /tmp/vllm_server.log${NC}"
+    echo -e "${CYAN}  Log: sudo docker exec ${CONTAINER_NAME} tail -f /llm/vllm.log${NC}"
     echo -e "${YELLOW}Waiting for server...${NC}"
 
     local N=0
@@ -880,7 +936,7 @@ start_vllm_server() {
 
         # Show progress every 30s
         if [ $((N % 6)) -eq 0 ]; then
-            LAST_LINE=$(sudo docker exec "$CONTAINER_NAME" tail -1 /tmp/vllm_server.log 2>/dev/null || echo "")
+            LAST_LINE=$(sudo docker exec "$CONTAINER_NAME" tail -1 /llm/vllm.log 2>/dev/null || echo "")
             echo -e "\n  ${CYAN}[${N}0s] ${LAST_LINE}${NC}"
         else
             echo -n "."
@@ -889,18 +945,18 @@ start_vllm_server() {
         # Crash detection — check if process died
         if ! sudo docker exec "$CONTAINER_NAME" pgrep -f "vllm" >/dev/null 2>&1; then
             # Check if OOM
-            if sudo docker exec "$CONTAINER_NAME" grep -qi "OUT_OF.*MEMORY\|CUDA out of memory\|out of memory\|UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY" /tmp/vllm_server.log 2>/dev/null; then
+            if sudo docker exec "$CONTAINER_NAME" grep -qi "OUT_OF.*MEMORY\|CUDA out of memory\|out of memory\|UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY" /llm/vllm.log 2>/dev/null; then
                 echo -e "\n${RED}[OOM] Out of GPU memory at max-model-len=${cur_model_len}${NC}"
                 return 2  # OOM exit code
             fi
             echo -e "\n${RED}[FAIL] Server crashed. Full log:${NC}"
-            sudo docker exec "$CONTAINER_NAME" cat /tmp/vllm_server.log
+            sudo docker exec "$CONTAINER_NAME" cat /llm/vllm.log
             return 1  # non-OOM crash
         fi
 
         if [ $N -ge 60 ]; then
             echo -e "\n${RED}[FAIL] Timeout (5 min). Log:${NC}"
-            sudo docker exec "$CONTAINER_NAME" tail -30 /tmp/vllm_server.log
+            sudo docker exec "$CONTAINER_NAME" tail -30 /llm/vllm.log
             return 1
         fi
     done
@@ -948,8 +1004,8 @@ fi
 # ==============================================================================
 echo -e "\n${CYAN}--- Running Benchmark ---${NC}"
 
-if [ "$MODEL_TASK" = "generate" ]; then
-    # ---------- Text generation benchmark ----------
+if [ "$MODEL_TASK" = "generate" ] || [ "$MODEL_TASK" = "multimodal" ]; then
+    # ---------- Text generation benchmark (also used for multimodal text-only) ----------
     IN_LEN=1024
     OUT_LEN=512
     NUM_PROMPTS=10
@@ -1049,36 +1105,58 @@ else:
 "
 
 elif [ "$MODEL_TASK" = "score" ]; then
-    # ---------- Reranker/Score benchmark ----------
+    # ---------- Reranker benchmark (Intel spec section 2.3) ----------
     NUM_PROMPTS=50
 
     echo -e "  Task:         reranker (scoring)"
     echo -e "  num-prompts:  ${NUM_PROMPTS}"
-    echo -e "  Endpoint:     /v1/score"
+    echo -e "  Endpoint:     /v1/rerank"
     echo ""
 
+    # Uses /v1/rerank endpoint per Intel llm-scaler README section 2.3
     sudo docker exec -it "$CONTAINER_NAME" python3 -c "
-import time, requests, random, string, json
+import time, requests, random, string
 
-url = 'http://localhost:${VLLM_PORT}/v1/score'
+url = 'http://localhost:${VLLM_PORT}/v1/rerank'
 model = '${MODEL_NAME}'
 num_prompts = ${NUM_PROMPTS}
 
-print(f'Sending {num_prompts} scoring requests...')
+# Sample documents for reranking
+sample_docs = [
+    'The capital of France is Paris.',
+    'The capital of Brazil is Brasilia.',
+    'Horses and cows are both animals.',
+    'The French have a rich tradition in engineering.',
+    'Machine learning is a subset of artificial intelligence.',
+    'Python is a popular programming language.',
+    'The Pacific Ocean is the largest ocean on Earth.',
+    'Quantum computing uses quantum mechanical phenomena.',
+]
+
+print(f'Sending {num_prompts} rerank requests...')
 latencies = []
 errors = 0
 for i in range(num_prompts):
-    query = ' '.join(''.join(random.choices(string.ascii_lowercase, k=5)) for _ in range(20))
-    doc = ' '.join(''.join(random.choices(string.ascii_lowercase, k=5)) for _ in range(50))
+    query = ' '.join(''.join(random.choices(string.ascii_lowercase, k=5)) for _ in range(10))
+    # Pick 4 random docs
+    docs = random.sample(sample_docs, min(4, len(sample_docs)))
     t0 = time.time()
     try:
-        r = requests.post(url, json={'model': model, 'text_1': query, 'text_2': doc}, timeout=60)
+        r = requests.post(url, json={
+            'model': model,
+            'query': query,
+            'documents': docs
+        }, timeout=60)
         r.raise_for_status()
         latencies.append(time.time() - t0)
     except Exception as e:
         errors += 1
         if errors <= 3:
             print(f'  Error on request {i+1}: {e}')
+        if errors == 4:
+            # Try /v1/score as fallback
+            print('  Trying /v1/score as fallback...')
+            url = 'http://localhost:${VLLM_PORT}/v1/score'
     if (i+1) % 10 == 0:
         print(f'  {i+1}/{num_prompts} done...')
 
@@ -1100,10 +1178,21 @@ else:
 "
 
 else
-    # ---------- Other model types (reward, etc.) ----------
-    echo -e "${YELLOW}  No standard benchmark for task type '${MODEL_TASK}'.${NC}"
-    echo -e "${GREEN}  Server is running on port ${VLLM_PORT} — you can test manually.${NC}"
-    echo -e "  Example: curl http://localhost:${VLLM_PORT}/v1/models"
+    # ---------- Other model types (reward, multimodal manual test, etc.) ----------
+    echo -e "${GREEN}  Server is running on port ${VLLM_PORT}.${NC}"
+    echo -e "  Task type: ${MODEL_TASK}"
+    echo ""
+    echo -e "${CYAN}  Available endpoints:${NC}"
+    echo -e "    curl http://localhost:${VLLM_PORT}/v1/models"
+    if [ "$IS_MULTIMODAL" = true ]; then
+        echo -e "    curl http://localhost:${VLLM_PORT}/v1/chat/completions (with image_url)"
+    fi
+    echo ""
+    echo -e "${YELLOW}  No automated benchmark for this model type. Test manually above.${NC}"
+    echo -e "${YELLOW}  Press Ctrl+C to stop, or the server will keep running.${NC}"
+    echo ""
+    # Wait for user to stop
+    read -p "Press Enter to stop the server and exit..." || true
 fi
 
 echo -e "\n${GREEN}=====================================================${NC}"
