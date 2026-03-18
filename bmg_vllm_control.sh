@@ -479,30 +479,163 @@ try:
         except ImportError:
             pass
 
-    # --- Detect model type (all types supported by Intel llm-scaler) ---
-    model_type = cfg.get('model_type', '').lower()
-    arch_str = ' '.join(archs).lower()
+    # ========================================================================
+    # Robust model type detection from REAL config.json parameters
+    # Uses: architectures, model_type, config keys (vision_config, audio_config)
+    # Ref: https://github.com/intel/llm-scaler/blob/main/vllm/README.md
+    # ========================================================================
+    model_type_str = cfg.get('model_type', '').lower()
     model_name_lower = os.path.basename(model_dir).lower()
 
-    # Detect task type for vLLM --task flag
-    # Order matters: check specific types first
-    is_embedding = any(kw in s for kw in ['embedding'] for s in [arch_str, model_type, model_name_lower])
-    is_reranker = any(kw in s for kw in ['reranker', 'rerank'] for s in [arch_str, model_type, model_name_lower])
-    is_classifier = any('ForSequenceClassification' in a or 'ForTokenClassification' in a for a in archs)
-    is_reward = any(kw in s for kw in ['reward'] for s in [arch_str, model_type, model_name_lower])
-    is_mm = any(kw in s for kw in ['vl', 'vision', 'visual', 'image', 'video']
-                for s in [arch_str, model_type])
+    # 1. Detect multimodal capabilities from config.json structure
+    #    These keys exist in the config of vision/audio/omni models
+    vision_keys = ['vision_config', 'visual_config', 'vision_tower',
+                   'image_size', 'vision_feature_layer', 'mm_vision_tower',
+                   'visual', 'img_size', 'image_token_id']
+    audio_keys = ['audio_config', 'audio_tower', 'audio_token_id',
+                  'audio_encoder']
+    has_vision = any(k in cfg for k in vision_keys)
+    has_audio = any(k in cfg for k in audio_keys)
 
-    if is_reranker or is_classifier:
-        print('OK_SCORE')
-    elif is_embedding:
-        print('OK_EMBED')
-    elif is_reward:
-        print('OK_REWARD')
-    elif is_mm:
-        print('OK_MULTIMODAL')
-    else:
-        print('OK_GENERATE')
+    # Also check model_type for multimodal hints
+    mm_type_kws = ['vl', 'vision', 'visual', 'image', 'video', 'qwen2_vl',
+                   'llava', 'cogvlm', 'internvl', 'minicpm_v', 'phi3_v']
+    if any(kw in model_type_str for kw in mm_type_kws):
+        has_vision = True
+    omni_type_kws = ['omni', 'qwen_omni', 'qwen2_omni']
+    if any(kw in model_type_str for kw in omni_type_kws):
+        has_vision = True
+        has_audio = True
+
+    # 2. Detect task from architecture class name suffixes
+    #    This is the most reliable signal from HuggingFace models
+    detected_task = ''
+    for arch in archs:
+        # Reward models
+        if 'RewardModel' in arch or 'ForReward' in arch:
+            detected_task = 'reward'
+            break
+        # Sequence/token classification → scoring/reranking
+        if 'ForSequenceClassification' in arch or 'ForTokenClassification' in arch:
+            detected_task = 'score'
+            break
+        # Causal LM (text generation)
+        if 'ForCausalLM' in arch or 'LMHeadModel' in arch:
+            detected_task = 'generate'
+            # Don't break: multimodal override may apply below
+            continue
+        # Conditional generation (seq2seq, or multimodal generation)
+        if 'ForConditionalGeneration' in arch:
+            detected_task = 'generate'
+            continue
+        # Masked LM → typically used as embedding backbone
+        if 'ForMaskedLM' in arch:
+            detected_task = 'embed'
+            break
+
+    # 3. Base model architectures (no task suffix) → typically embeddings
+    #    e.g. XLMRobertaModel, BertModel, Qwen2Model used as embedding
+    if not detected_task:
+        for arch in archs:
+            # Ends with just 'Model' and no other task suffix
+            if (arch.endswith('Model')
+                and 'CausalLM' not in arch
+                and 'Classification' not in arch
+                and 'Generation' not in arch
+                and 'Reward' not in arch):
+                detected_task = 'embed'
+                break
+
+    # 4. model_type / model_name overrides for known patterns
+    #    Some models are better identified by their model_type or name
+    reranker_kws = ['reranker', 'rerank', 'cross-encoder', 'crossencoder']
+    reward_kws = ['reward', 'rm-', '-rm']
+    embed_kws = ['embedding', 'encoder', 'e5-', 'bge-', 'gte-', 'sentence-']
+    ocr_kws = ['ocr', 'got-ocr', 'ocr2']
+
+    for s in [model_type_str, model_name_lower]:
+        if any(kw in s for kw in reranker_kws):
+            detected_task = 'score'
+            break
+        if any(kw in s for kw in reward_kws):
+            detected_task = 'reward'
+            break
+    # Only override to embed if not already classified as score/reward
+    if detected_task not in ('score', 'reward'):
+        for s in [model_type_str, model_name_lower]:
+            if any(kw in s for kw in embed_kws):
+                detected_task = 'embed'
+                break
+    # OCR detection
+    for s in [model_type_str, model_name_lower]:
+        if any(kw in s for kw in ocr_kws):
+            detected_task = 'multimodal'
+            has_vision = True
+            break
+
+    # 5. Apply multimodal/omni overrides
+    #    A model with vision_config that generates text is multimodal
+    #    A model with both vision+audio is omni
+    if has_vision and has_audio:
+        detected_task = 'omni'
+    elif has_vision and detected_task in ('generate', ''):
+        detected_task = 'multimodal'
+    elif has_vision and detected_task == 'embed':
+        detected_task = 'embed'  # VL embedding (keep embed, server handles it)
+    elif has_vision and detected_task == 'score':
+        detected_task = 'score'  # VL reranker (keep score, server handles it)
+
+    # 6. Default: if nothing matched, assume text generation
+    if not detected_task:
+        detected_task = 'generate'
+
+    # 7. Try vLLM's own task inference as validation (best-effort)
+    vllm_task = ''
+    try:
+        from vllm import LLM
+        # Check if vLLM can infer the task from model config
+        # This uses vLLM's internal model registry mapping
+        from vllm.config import ModelConfig
+        mc = ModelConfig(
+            model=model_dir,
+            task='auto',
+            tokenizer=model_dir,
+            tokenizer_mode='auto',
+            trust_remote_code=True,
+            dtype='float16',
+            seed=0,
+        )
+        vllm_task = mc.task or ''
+        if vllm_task:
+            # Map vLLM task names to our names
+            task_map = {
+                'generate': 'generate',
+                'embed': 'embed',
+                'score': 'score',
+                'reward': 'reward',
+                'classify': 'score',
+            }
+            mapped = task_map.get(vllm_task, '')
+            if mapped:
+                # vLLM inference overrides our heuristic (unless multimodal/omni)
+                if detected_task not in ('multimodal', 'omni'):
+                    detected_task = mapped
+                elif mapped != 'generate':
+                    detected_task = mapped  # VL embed/score/reward
+    except Exception:
+        pass  # vLLM inference not available, use our heuristic
+
+    # Output result with extra info for display
+    task_upper = detected_task.upper()
+    arch_display = archs[0] if archs else 'unknown'
+    extra = ''
+    if has_vision and detected_task not in ('multimodal', 'omni'):
+        extra = '+vision'
+    if has_audio and detected_task != 'omni':
+        extra += '+audio'
+    if vllm_task:
+        extra += f' vllm_inferred={vllm_task}'
+    print(f'OK_{task_upper}:{arch_display}:{model_type_str}:{extra.strip()}')
 
     # --- Deep check: try loading config through transformers ---
     try:
@@ -531,6 +664,9 @@ except Exception as e:
 
 # Determine model task type and vLLM --task flag
 MODEL_TASK="generate"  # default
+DETECTED_ARCH=""
+DETECTED_MODEL_TYPE=""
+DETECTED_EXTRA=""
 case "$MODEL_CHECK" in
     UNSUPPORTED_ARCH:*)
         BAD_ARCH="${MODEL_CHECK#UNSUPPORTED_ARCH:}"
@@ -557,25 +693,53 @@ case "$MODEL_CHECK" in
         echo -e "${RED}[FAIL] No config.json in model directory.${NC}"
         exit 1
         ;;
-    OK_EMBED*)
+    OK_EMBED:*)
         MODEL_TASK="embed"
+        DETECTED_ARCH=$(echo "$MODEL_CHECK" | cut -d: -f2)
+        DETECTED_MODEL_TYPE=$(echo "$MODEL_CHECK" | cut -d: -f3)
+        DETECTED_EXTRA=$(echo "$MODEL_CHECK" | cut -d: -f4-)
         echo -e "${GREEN}[OK] Model compatible (embedding).${NC}"
+        [ -n "$DETECTED_ARCH" ] && echo -e "  Architecture: ${DETECTED_ARCH}"
         ;;
-    OK_SCORE*)
+    OK_SCORE:*)
         MODEL_TASK="score"
+        DETECTED_ARCH=$(echo "$MODEL_CHECK" | cut -d: -f2)
+        DETECTED_MODEL_TYPE=$(echo "$MODEL_CHECK" | cut -d: -f3)
+        DETECTED_EXTRA=$(echo "$MODEL_CHECK" | cut -d: -f4-)
         echo -e "${GREEN}[OK] Model compatible (reranker/scoring).${NC}"
+        [ -n "$DETECTED_ARCH" ] && echo -e "  Architecture: ${DETECTED_ARCH}"
         ;;
-    OK_REWARD*)
+    OK_REWARD:*)
         MODEL_TASK="reward"
-        echo -e "${GREEN}[OK] Model compatible (reward).${NC}"
+        DETECTED_ARCH=$(echo "$MODEL_CHECK" | cut -d: -f2)
+        DETECTED_MODEL_TYPE=$(echo "$MODEL_CHECK" | cut -d: -f3)
+        DETECTED_EXTRA=$(echo "$MODEL_CHECK" | cut -d: -f4-)
+        echo -e "${GREEN}[OK] Model compatible (reward model).${NC}"
+        [ -n "$DETECTED_ARCH" ] && echo -e "  Architecture: ${DETECTED_ARCH}"
         ;;
-    OK_MULTIMODAL*)
+    OK_MULTIMODAL:*)
         MODEL_TASK="multimodal"
+        DETECTED_ARCH=$(echo "$MODEL_CHECK" | cut -d: -f2)
+        DETECTED_MODEL_TYPE=$(echo "$MODEL_CHECK" | cut -d: -f3)
+        DETECTED_EXTRA=$(echo "$MODEL_CHECK" | cut -d: -f4-)
         echo -e "${GREEN}[OK] Model compatible (vision/multimodal).${NC}"
+        [ -n "$DETECTED_ARCH" ] && echo -e "  Architecture: ${DETECTED_ARCH}"
         ;;
-    OK_GENERATE*)
+    OK_OMNI:*)
+        MODEL_TASK="omni"
+        DETECTED_ARCH=$(echo "$MODEL_CHECK" | cut -d: -f2)
+        DETECTED_MODEL_TYPE=$(echo "$MODEL_CHECK" | cut -d: -f3)
+        DETECTED_EXTRA=$(echo "$MODEL_CHECK" | cut -d: -f4-)
+        echo -e "${GREEN}[OK] Model compatible (omni: vision + audio).${NC}"
+        [ -n "$DETECTED_ARCH" ] && echo -e "  Architecture: ${DETECTED_ARCH}"
+        ;;
+    OK_GENERATE:*)
         MODEL_TASK="generate"
+        DETECTED_ARCH=$(echo "$MODEL_CHECK" | cut -d: -f2)
+        DETECTED_MODEL_TYPE=$(echo "$MODEL_CHECK" | cut -d: -f3)
+        DETECTED_EXTRA=$(echo "$MODEL_CHECK" | cut -d: -f4-)
         echo -e "${GREEN}[OK] Model compatible (text generation).${NC}"
+        [ -n "$DETECTED_ARCH" ] && echo -e "  Architecture: ${DETECTED_ARCH}"
         ;;
     SKIP|WARN:*)
         echo -e "${YELLOW}[WARN] Could not fully verify compatibility (continuing anyway).${NC}"
@@ -585,6 +749,7 @@ case "$MODEL_CHECK" in
         ;;
 esac
 echo -e "  Task type: ${MODEL_TASK}"
+[ -n "$DETECTED_EXTRA" ] && echo -e "  Detection info: ${DETECTED_EXTRA}"
 
 # ==============================================================================
 # STEP 6: Auto-profile model from config.json (no guessing)
@@ -834,7 +999,7 @@ else
 fi
 
 # Task flag: per Intel llm-scaler spec (their vLLM build supports --task)
-# Ref: Section 2.3 of Intel README
+# Ref: https://github.com/intel/llm-scaler/blob/main/vllm/README.md
 TASK_ARGS=""
 if [ "$MODEL_TASK" = "embed" ]; then
     TASK_ARGS="--task embed"
@@ -843,10 +1008,11 @@ elif [ "$MODEL_TASK" = "score" ]; then
 elif [ "$MODEL_TASK" = "reward" ]; then
     TASK_ARGS="--task reward"
 fi
+# Note: multimodal, omni, generate do not need --task (auto-detected by vLLM)
 
 # Per-task-type flags from Intel spec:
-# - Embed/Score: --no-enable-prefix-caching, max-num-batched-tokens=2048
-# - Multimodal VL: no --disable-sliding-window, --allowed-local-media-path, max-num-batched-tokens=5120
+# - Embed/Score/Reward: --no-enable-prefix-caching, max-num-batched-tokens=2048
+# - Multimodal VL/Omni: --allowed-local-media-path, --no-enable-prefix-caching, max-num-batched-tokens=5120
 # - Text generation: --disable-sliding-window, max-num-batched-tokens=8192
 EXTRA_ARGS=""
 BATCHED_TOKENS=8192
@@ -854,19 +1020,29 @@ IS_MULTIMODAL=false
 
 case "$MODEL_TASK" in
     embed|score|reward)
-        # Intel spec section 2.3: prefix caching off, lower batched tokens
+        # Intel spec: prefix caching off, lower batched tokens for non-generative
         EXTRA_ARGS="--no-enable-prefix-caching"
         BATCHED_TOKENS=2048
         ;;
     multimodal)
-        # Intel spec section 2.4: no --disable-sliding-window, need media path
+        # Intel spec: vision models need media path, no sliding window issues
         IS_MULTIMODAL=true
         EXTRA_ARGS="--allowed-local-media-path /llm/models/test --no-enable-prefix-caching"
         BATCHED_TOKENS=5120
         sudo docker exec "$CONTAINER_NAME" mkdir -p /llm/models/test 2>/dev/null || true
         ;;
+    omni)
+        # Intel spec: omni models (audio+vision) similar to multimodal
+        IS_MULTIMODAL=true
+        EXTRA_ARGS="--allowed-local-media-path /llm/models/test --no-enable-prefix-caching"
+        BATCHED_TOKENS=5120
+        sudo docker exec "$CONTAINER_NAME" mkdir -p /llm/models/test 2>/dev/null || true
+        # Install audio dependencies inside container (needed for omni models)
+        echo -e "${YELLOW}Installing audio dependencies for omni model...${NC}"
+        sudo docker exec "$CONTAINER_NAME" pip install librosa audioread 2>/dev/null || true
+        ;;
     generate)
-        # Intel spec section 1.4.1: standard text generation
+        # Intel spec: standard text generation
         EXTRA_ARGS="--disable-sliding-window"
         BATCHED_TOKENS=8192
         ;;
@@ -1001,11 +1177,14 @@ fi
 
 # ==============================================================================
 # STEP 8: Run benchmark (Intel spec)
+# Automatically selects the correct benchmark method based on detected model type
+# Ref: https://github.com/intel/llm-scaler/blob/main/vllm/README.md
 # ==============================================================================
 echo -e "\n${CYAN}--- Running Benchmark ---${NC}"
 
-if [ "$MODEL_TASK" = "generate" ] || [ "$MODEL_TASK" = "multimodal" ]; then
-    # ---------- Text generation benchmark (also used for multimodal text-only) ----------
+if [ "$MODEL_TASK" = "generate" ]; then
+    # ---------- Text generation benchmark ----------
+    # Uses vllm bench serve with random dataset per Intel spec
     IN_LEN=1024
     OUT_LEN=512
     NUM_PROMPTS=10
@@ -1045,8 +1224,138 @@ if [ "$MODEL_TASK" = "generate" ] || [ "$MODEL_TASK" = "multimodal" ]; then
             --port=${VLLM_PORT}
     "
 
+elif [ "$MODEL_TASK" = "multimodal" ] || [ "$MODEL_TASK" = "omni" ]; then
+    # ---------- Multimodal / Omni benchmark ----------
+    # Phase 1: text-only throughput via vllm bench serve
+    # Phase 2: vision inference via /v1/chat/completions with test image
+    NUM_PROMPTS=10
+
+    echo -e "  Task:         ${MODEL_TASK}"
+    echo -e "  Phase 1:      text-only throughput (vllm bench serve)"
+    echo -e "  Phase 2:      vision inference (/v1/chat/completions with image)"
+    echo ""
+
+    # Phase 1: text-only throughput benchmark
+    IN_LEN=512
+    OUT_LEN=256
+    MAX_BENCH=$(( MODEL_LEN - 256 ))
+    if [ $(( IN_LEN + OUT_LEN )) -gt "$MAX_BENCH" ]; then
+        IN_LEN=$(( MAX_BENCH * 2 / 3 ))
+        OUT_LEN=$(( MAX_BENCH - IN_LEN ))
+        IN_LEN=$(( (IN_LEN / 128) * 128 ))
+        OUT_LEN=$(( (OUT_LEN / 128) * 128 ))
+        [ "$IN_LEN" -lt 128 ] && IN_LEN=128
+        [ "$OUT_LEN" -lt 128 ] && OUT_LEN=128
+    fi
+
+    echo -e "${CYAN}  [Phase 1] Text-only throughput...${NC}"
+    sudo docker exec -it "$CONTAINER_NAME" bash -c "
+        source /opt/intel/oneapi/setvars.sh --force 2>/dev/null || true
+        vllm bench serve \
+            --model /llm/models/${MODEL_NAME} \
+            --dataset-name random \
+            --served-model-name ${MODEL_NAME} \
+            --random-input-len=${IN_LEN} \
+            --random-output-len=${OUT_LEN} \
+            --ignore-eos \
+            --num-prompt ${NUM_PROMPTS} \
+            --trust_remote_code \
+            --request-rate inf \
+            --backend vllm \
+            --port=${VLLM_PORT}
+    " || echo -e "${YELLOW}  Text-only benchmark not supported for this model, skipping...${NC}"
+
+    # Phase 2: vision inference with generated test image
+    echo ""
+    echo -e "${CYAN}  [Phase 2] Vision inference with test image...${NC}"
+    NUM_VISION=5
+    sudo docker exec -it "$CONTAINER_NAME" python3 -c "
+import time, requests, json, base64, struct, zlib
+
+# Generate a minimal valid 64x64 PNG test image (solid color, ~100 bytes)
+def make_test_png(width=64, height=64, r=70, g=130, b=180):
+    def chunk(chunk_type, data):
+        c = chunk_type + data
+        return struct.pack('>I', len(data)) + c + struct.pack('>I', zlib.crc32(c) & 0xffffffff)
+    header = b'\\x89PNG\\r\\n\\x1a\\n'
+    ihdr = chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0))
+    raw = b''
+    for y in range(height):
+        raw += b'\\x00'  # filter: none
+        for x in range(width):
+            raw += bytes([r, g, b])
+    idat = chunk(b'IDAT', zlib.compress(raw))
+    iend = chunk(b'IEND', b'')
+    return header + ihdr + idat + iend
+
+png_bytes = make_test_png()
+b64_image = base64.b64encode(png_bytes).decode('ascii')
+
+url = 'http://localhost:${VLLM_PORT}/v1/chat/completions'
+model = '${MODEL_NAME}'
+num_requests = ${NUM_VISION}
+
+print(f'Sending {num_requests} vision requests with 64x64 test image...')
+latencies = []
+errors = 0
+for i in range(num_requests):
+    payload = {
+        'model': model,
+        'messages': [{
+            'role': 'user',
+            'content': [
+                {
+                    'type': 'image_url',
+                    'image_url': {'url': f'data:image/png;base64,{b64_image}'}
+                },
+                {
+                    'type': 'text',
+                    'text': 'Describe what you see in this image in one sentence.'
+                }
+            ]
+        }],
+        'max_tokens': 128
+    }
+    t0 = time.time()
+    try:
+        resp = requests.post(url, json=payload, timeout=120)
+        resp.raise_for_status()
+        result = resp.json()
+        latencies.append(time.time() - t0)
+        if i == 0:
+            # Show first response as sample
+            content = result.get('choices', [{}])[0].get('message', {}).get('content', '')
+            print(f'  Sample response: {content[:200]}')
+    except Exception as e:
+        errors += 1
+        if errors <= 3:
+            print(f'  Error on request {i+1}: {e}')
+            if hasattr(e, 'response') and e.response is not None:
+                print(f'    Response: {e.response.text[:300]}')
+    print(f'  {i+1}/{num_requests} done ({"%.1f" % (time.time()-t0)}s)')
+
+if latencies:
+    latencies.sort()
+    avg = sum(latencies) / len(latencies)
+    p50 = latencies[len(latencies)//2]
+    p99 = latencies[int(len(latencies)*0.99)]
+    throughput = len(latencies) / sum(latencies)
+    print()
+    print(f'=== Vision Inference Results ===')
+    print(f'  Successful:   {len(latencies)}/{num_requests}')
+    print(f'  Throughput:   {throughput:.2f} req/s')
+    print(f'  Avg latency:  {avg*1000:.1f} ms')
+    print(f'  P50 latency:  {p50*1000:.1f} ms')
+    print(f'  P99 latency:  {p99*1000:.1f} ms')
+else:
+    print('No successful vision requests.')
+    print('  The model may not support the OpenAI vision API format.')
+    print('  Check the server log: sudo docker exec ${CONTAINER_NAME} tail -50 /llm/vllm.log')
+"
+
 elif [ "$MODEL_TASK" = "embed" ]; then
     # ---------- Embedding benchmark ----------
+    # Uses /v1/embeddings endpoint per Intel spec
     NUM_PROMPTS=100
     IN_LEN=256
 
@@ -1056,7 +1365,6 @@ elif [ "$MODEL_TASK" = "embed" ]; then
     echo -e "  Endpoint:     /v1/embeddings"
     echo ""
 
-    # Use curl-based benchmark for embeddings: send random text to /v1/embeddings
     sudo docker exec -it "$CONTAINER_NAME" python3 -c "
 import time, requests, random, string, json
 
@@ -1071,19 +1379,31 @@ for _ in range(num_prompts):
     text = ' '.join(''.join(random.choices(string.ascii_lowercase, k=5)) for _ in range(input_len // 6))
     prompts.append(text)
 
-print(f'Sending {num_prompts} embedding requests...')
+print(f'Sending {num_prompts} embedding requests (input ~{input_len} tokens each)...')
 latencies = []
 errors = 0
 for i, text in enumerate(prompts):
     t0 = time.time()
     try:
-        r = requests.post(url, json={'model': model, 'input': text}, timeout=60)
+        r = requests.post(url, json={
+            'model': model,
+            'input': text,
+            'encoding_format': 'float'
+        }, timeout=60)
         r.raise_for_status()
         latencies.append(time.time() - t0)
+        if i == 0:
+            # Show embedding dimension from first response
+            data = r.json().get('data', [{}])
+            if data and 'embedding' in data[0]:
+                dim = len(data[0]['embedding'])
+                print(f'  Embedding dimension: {dim}')
     except Exception as e:
         errors += 1
         if errors <= 3:
             print(f'  Error on request {i+1}: {e}')
+            if hasattr(e, 'response') and e.response is not None:
+                print(f'    Response: {e.response.text[:300]}')
     if (i+1) % 20 == 0:
         print(f'  {i+1}/{num_prompts} done...')
 
@@ -1102,24 +1422,25 @@ if latencies:
     print(f'  P99 latency:  {p99*1000:.1f} ms')
 else:
     print('No successful requests.')
+    print('  Check server log: sudo docker exec ${CONTAINER_NAME} tail -50 /llm/vllm.log')
 "
 
 elif [ "$MODEL_TASK" = "score" ]; then
-    # ---------- Reranker benchmark (Intel spec section 2.3) ----------
+    # ---------- Reranker/Scoring benchmark ----------
+    # Uses /v1/rerank endpoint per Intel spec, with /v1/score fallback
     NUM_PROMPTS=50
 
     echo -e "  Task:         reranker (scoring)"
     echo -e "  num-prompts:  ${NUM_PROMPTS}"
-    echo -e "  Endpoint:     /v1/rerank"
+    echo -e "  Endpoint:     /v1/rerank (fallback: /v1/score)"
     echo ""
 
-    # Uses /v1/rerank endpoint per Intel llm-scaler README section 2.3
     sudo docker exec -it "$CONTAINER_NAME" python3 -c "
-import time, requests, random, string
+import time, requests, random, string, json
 
-url = 'http://localhost:${VLLM_PORT}/v1/rerank'
 model = '${MODEL_NAME}'
 num_prompts = ${NUM_PROMPTS}
+port = ${VLLM_PORT}
 
 # Sample documents for reranking
 sample_docs = [
@@ -1133,30 +1454,75 @@ sample_docs = [
     'Quantum computing uses quantum mechanical phenomena.',
 ]
 
-print(f'Sending {num_prompts} rerank requests...')
+sample_queries = [
+    'What is the capital of France?',
+    'Tell me about animals.',
+    'What programming languages are popular?',
+    'Explain quantum computing.',
+    'What is the largest ocean?',
+]
+
+# Auto-detect endpoint: try /v1/rerank first, then /v1/score
+url = f'http://localhost:{port}/v1/rerank'
+use_score_format = False
+
+# Test which endpoint works
+test_query = 'test query'
+test_docs = ['test document one', 'test document two']
+try:
+    r = requests.post(url, json={
+        'model': model, 'query': test_query, 'documents': test_docs
+    }, timeout=30)
+    r.raise_for_status()
+    print(f'Using endpoint: /v1/rerank')
+except Exception:
+    # Try /v1/score format
+    url = f'http://localhost:{port}/v1/score'
+    try:
+        r = requests.post(url, json={
+            'model': model, 'text_1': test_query, 'text_2': test_docs[0]
+        }, timeout=30)
+        r.raise_for_status()
+        use_score_format = True
+        print(f'Using endpoint: /v1/score')
+    except Exception as e:
+        print(f'Neither /v1/rerank nor /v1/score responded. Error: {e}')
+        if hasattr(e, 'response') and e.response is not None:
+            print(f'  Response: {e.response.text[:300]}')
+        print('Check server log: sudo docker exec lsv-container tail -50 /llm/vllm.log')
+        import sys; sys.exit(1)
+
+print(f'Sending {num_prompts} requests...')
 latencies = []
 errors = 0
 for i in range(num_prompts):
-    query = ' '.join(''.join(random.choices(string.ascii_lowercase, k=5)) for _ in range(10))
-    # Pick 4 random docs
-    docs = random.sample(sample_docs, min(4, len(sample_docs)))
+    query = random.choice(sample_queries)
     t0 = time.time()
     try:
-        r = requests.post(url, json={
-            'model': model,
-            'query': query,
-            'documents': docs
-        }, timeout=60)
+        if use_score_format:
+            doc = random.choice(sample_docs)
+            r = requests.post(url, json={
+                'model': model,
+                'text_1': query,
+                'text_2': doc
+            }, timeout=60)
+        else:
+            docs = random.sample(sample_docs, min(4, len(sample_docs)))
+            r = requests.post(url, json={
+                'model': model,
+                'query': query,
+                'documents': docs
+            }, timeout=60)
         r.raise_for_status()
         latencies.append(time.time() - t0)
+        if i == 0:
+            # Show sample result
+            result = r.json()
+            print(f'  Sample response: {json.dumps(result, indent=2)[:300]}')
     except Exception as e:
         errors += 1
         if errors <= 3:
             print(f'  Error on request {i+1}: {e}')
-        if errors == 4:
-            # Try /v1/score as fallback
-            print('  Trying /v1/score as fallback...')
-            url = 'http://localhost:${VLLM_PORT}/v1/score'
     if (i+1) % 10 == 0:
         print(f'  {i+1}/{num_prompts} done...')
 
@@ -1167,7 +1533,7 @@ if latencies:
     p99 = latencies[int(len(latencies)*0.99)]
     throughput = len(latencies) / sum(latencies)
     print()
-    print(f'=== Reranker Benchmark Results ===')
+    print(f'=== Reranker/Score Benchmark Results ===')
     print(f'  Successful:   {len(latencies)}/{num_prompts}')
     print(f'  Throughput:   {throughput:.2f} req/s')
     print(f'  Avg latency:  {avg*1000:.1f} ms')
@@ -1177,21 +1543,159 @@ else:
     print('No successful requests.')
 "
 
+elif [ "$MODEL_TASK" = "reward" ]; then
+    # ---------- Reward model benchmark ----------
+    # Uses /v1/score endpoint with prompt-response pairs
+    NUM_PROMPTS=50
+
+    echo -e "  Task:         reward model"
+    echo -e "  num-prompts:  ${NUM_PROMPTS}"
+    echo -e "  Endpoint:     /v1/score"
+    echo ""
+
+    sudo docker exec -it "$CONTAINER_NAME" python3 -c "
+import time, requests, random, json
+
+model = '${MODEL_NAME}'
+num_prompts = ${NUM_PROMPTS}
+port = ${VLLM_PORT}
+
+# Sample prompt-response pairs for reward scoring
+sample_pairs = [
+    ('What is the capital of France?', 'The capital of France is Paris.'),
+    ('What is the capital of France?', 'I like pizza.'),
+    ('Explain gravity briefly.', 'Gravity is a fundamental force that attracts objects with mass toward each other.'),
+    ('Explain gravity briefly.', 'Gravity is when stuff falls down because reasons.'),
+    ('Write a polite email.', 'Dear Sir/Madam, I hope this email finds you well. I am writing to inquire about...'),
+    ('Write a polite email.', 'hey send me the thing asap'),
+    ('What is machine learning?', 'Machine learning is a branch of AI that enables systems to learn from data.'),
+    ('What is machine learning?', 'Machine learning is a computer thing.'),
+    ('How does photosynthesis work?', 'Photosynthesis converts sunlight, CO2, and water into glucose and oxygen.'),
+    ('How does photosynthesis work?', 'Plants eat sunlight.'),
+]
+
+# Auto-detect endpoint format
+url = f'http://localhost:{port}/v1/score'
+use_chat_format = False
+
+# Test /v1/score with text pair format
+prompt, response = sample_pairs[0]
+try:
+    r = requests.post(url, json={
+        'model': model, 'text_1': prompt, 'text_2': response
+    }, timeout=30)
+    r.raise_for_status()
+    print(f'Using endpoint: /v1/score (text pair format)')
+except Exception:
+    # Try chat/conversation format for reward models that expect it
+    try:
+        r = requests.post(url, json={
+            'model': model,
+            'messages': [
+                {'role': 'user', 'content': prompt},
+                {'role': 'assistant', 'content': response}
+            ]
+        }, timeout=30)
+        r.raise_for_status()
+        use_chat_format = True
+        print(f'Using endpoint: /v1/score (chat format)')
+    except Exception as e:
+        # Last resort: try /v1/chat/completions (some reward models are served as regular LLMs)
+        print(f'Warning: /v1/score not available ({e})')
+        print(f'Falling back to /v1/chat/completions for reward model...')
+        url = f'http://localhost:{port}/v1/chat/completions'
+        use_chat_format = True
+
+print(f'Sending {num_prompts} reward scoring requests...')
+latencies = []
+errors = 0
+scores = []
+for i in range(num_prompts):
+    prompt, response = random.choice(sample_pairs)
+    t0 = time.time()
+    try:
+        if '/v1/score' in url:
+            if use_chat_format:
+                payload = {
+                    'model': model,
+                    'messages': [
+                        {'role': 'user', 'content': prompt},
+                        {'role': 'assistant', 'content': response}
+                    ]
+                }
+            else:
+                payload = {
+                    'model': model,
+                    'text_1': prompt,
+                    'text_2': response
+                }
+        else:
+            # Fallback: chat completions
+            payload = {
+                'model': model,
+                'messages': [
+                    {'role': 'user', 'content': f'Rate this response:\\nPrompt: {prompt}\\nResponse: {response}'}
+                ],
+                'max_tokens': 64
+            }
+        r = requests.post(url, json=payload, timeout=60)
+        r.raise_for_status()
+        latencies.append(time.time() - t0)
+        result = r.json()
+        # Try to extract score
+        if 'score' in result:
+            scores.append(result['score'])
+        elif 'data' in result and result['data']:
+            for d in result['data']:
+                if 'score' in d:
+                    scores.append(d['score'])
+        if i == 0:
+            print(f'  Sample response: {json.dumps(result, indent=2)[:400]}')
+    except Exception as e:
+        errors += 1
+        if errors <= 3:
+            print(f'  Error on request {i+1}: {e}')
+            if hasattr(e, 'response') and e.response is not None:
+                print(f'    Response: {e.response.text[:300]}')
+    if (i+1) % 10 == 0:
+        print(f'  {i+1}/{num_prompts} done...')
+
+if latencies:
+    latencies.sort()
+    avg = sum(latencies) / len(latencies)
+    p50 = latencies[len(latencies)//2]
+    p99 = latencies[int(len(latencies)*0.99)]
+    throughput = len(latencies) / sum(latencies)
+    print()
+    print(f'=== Reward Model Benchmark Results ===')
+    print(f'  Successful:   {len(latencies)}/{num_prompts}')
+    print(f'  Throughput:   {throughput:.2f} req/s')
+    print(f'  Avg latency:  {avg*1000:.1f} ms')
+    print(f'  P50 latency:  {p50*1000:.1f} ms')
+    print(f'  P99 latency:  {p99*1000:.1f} ms')
+    if scores:
+        print(f'  Avg score:    {sum(scores)/len(scores):.4f}')
+        print(f'  Score range:  [{min(scores):.4f}, {max(scores):.4f}]')
+else:
+    print('No successful requests.')
+    print('  Check server log: sudo docker exec ${CONTAINER_NAME} tail -50 /llm/vllm.log')
+"
+
 else
-    # ---------- Other model types (reward, multimodal manual test, etc.) ----------
+    # ---------- Unknown model type fallback ----------
     echo -e "${GREEN}  Server is running on port ${VLLM_PORT}.${NC}"
     echo -e "  Task type: ${MODEL_TASK}"
     echo ""
     echo -e "${CYAN}  Available endpoints:${NC}"
     echo -e "    curl http://localhost:${VLLM_PORT}/v1/models"
+    echo -e "    curl http://localhost:${VLLM_PORT}/v1/chat/completions"
     if [ "$IS_MULTIMODAL" = true ]; then
         echo -e "    curl http://localhost:${VLLM_PORT}/v1/chat/completions (with image_url)"
     fi
     echo ""
-    echo -e "${YELLOW}  No automated benchmark for this model type. Test manually above.${NC}"
+    echo -e "${YELLOW}  No automated benchmark for task '${MODEL_TASK}'. Test manually above.${NC}"
     echo -e "${YELLOW}  Press Ctrl+C to stop, or the server will keep running.${NC}"
     echo ""
-    # Wait for user to stop
     read -p "Press Enter to stop the server and exit..." || true
 fi
 
