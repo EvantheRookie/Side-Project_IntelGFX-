@@ -14,7 +14,7 @@ sudo ./bmg_vllm_control.sh
 
 ## Requirements
 
-- Intel Arc Battlemage GPU (B580/B570), single or multiple
+- Intel Arc Battlemage GPU , single or multiple
 - Linux with Intel GPU drivers (`xpu-smi` must work)
 - Docker, GCC, Git + git-lfs
 
@@ -35,9 +35,9 @@ sudo ./bmg_vllm_control.sh
 Auto-detected. Models split across all GPUs with `-tp N`:
 
 ```
-1x B580 (24 GiB)  → models up to ~20 GB
-2x B580 (48 GiB)  → models up to ~40 GB
-3x B580 (72 GiB)  → models up to ~60 GB
+1x B60 (24 GiB)  → models up to ~20 GB
+2x B60 (48 GiB)  → models up to ~40 GB
+3x B60 (72 GiB)  → models up to ~60 GB
 ```
 
 Uses `CCL_TOPO_P2P_ACCESS=1` for optimal multi-GPU P2P communication.
