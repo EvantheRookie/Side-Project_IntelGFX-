@@ -42,9 +42,9 @@ Model type is auto-detected from `config.json` -- no manual flags needed.
 Multiple GPUs are **auto-detected**. The script splits the model across all GPUs using `-tp N`:
 
 ```
-1x B580 (24 GiB)  → models up to ~20 GB
-2x B580 (48 GiB)  → models up to ~40 GB with -tp 2
-3x B580 (72 GiB)  → models up to ~60 GB with -tp 3
+1x B60 (24 GiB)  → models up to ~20 GB
+2x B60 (48 GiB)  → models up to ~40 GB with -tp 2
+3x B60 (72 GiB)  → models up to ~60 GB with -tp 3
 ```
 
 Docker is configured with `--ipc=host` and `--shm-size=64g` for inter-GPU communication.
